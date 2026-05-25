@@ -1153,10 +1153,15 @@ impl TypeStabilityMonitor {
                             && write_end <= nf.byte_offset + nf.byte_size
                     });
                     // tail spill: write extends past the last field into struct
-                    // tail padding or alignment space (e.g. 16B XMM store on
-                    // last 8B function pointer). accept if overshoot ≤ 8 bytes.
+                    // tail padding or alignment space. tolerance scaled by SIMD width:
+                    // SSE=8B, AVX2=24B, AVX-512=56B. covers coalesced zero-init
+                    // and vectorized memset that overwrite tail padding.
+                    let max_tail: u64 = if write_size >= 64 { 56 }
+                        else if write_size >= 32 { 24 }
+                        else if write_size >= 16 { 8 }
+                        else { 0 };
                     let tail_spill = !coalesced
-                        && write_end <= proj.type_info.byte_size + 8
+                        && write_end <= proj.type_info.byte_size + max_tail
                         && write_end > proj.type_info.byte_size;
                     if !coalesced && !tail_spill {
                         tally.spanning += 1;
@@ -1383,6 +1388,11 @@ pub struct WorldState {
     pub type_epochs: TypeEpochLog,
     // /proc/pid/mem handle for retrospective_scan mem fallback
     pub proc_mem: Option<std::fs::File>,
+    // monotonic event counter at last ALLOC; HeapHole hazards are
+    // suppressed for HEAP_HOLE_GRACE events after any alloc to avoid
+    // false positives from cross-thread ALLOC/WRITE ring reordering.
+    pub last_alloc_event_count: u64,
+    pub total_event_count: u64,
 }
 
 impl WorldState {
@@ -1399,6 +1409,8 @@ impl WorldState {
             type_stability: TypeStabilityMonitor::new(),
             type_epochs: TypeEpochLog::new(65536),
             proc_mem: None,
+            last_alloc_event_count: 0,
+            total_event_count: 0,
         }
     }
 

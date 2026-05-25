@@ -593,19 +593,29 @@ impl RingOrchestrator {
         hdr.priority_bloom[b2 / 64] |= 1u64 << (b2 % 64);
     }
 
+    /// tiered backpressure: bp=0 normal, bp=1 shed reads, bp=2 shed non-bloom writes.
+    /// thresholds: 6/8 -> shed reads, 7/8 -> shed writes, <3/8 -> clear.
     pub fn update_backpressure(&self) {
-        const BP_HIGH: u32 = 6;
-        const BP_LOW: u32 = 3;
+        const BP_SHED_READS: u64 = 6;
+        const BP_SHED_WRITES: u64 = 7;
+        const BP_LOW: u64 = 3;
         for ring in &self.rings {
             let hdr = ring.header();
             let h = hdr.head.load(Ordering::Relaxed);
             let t = hdr.tail.load(Ordering::Relaxed);
             let fill_eighths = (h.saturating_sub(t) << 3) / hdr.capacity as u64;
             let bp = hdr.backpressure.load(Ordering::Relaxed);
-            if fill_eighths >= BP_HIGH as u64 && bp == 0 {
-                hdr.backpressure.store(1, Ordering::Release);
-            } else if fill_eighths < BP_LOW as u64 && bp != 0 {
-                hdr.backpressure.store(0, Ordering::Release);
+            let new_bp = if fill_eighths >= BP_SHED_WRITES {
+                2
+            } else if fill_eighths >= BP_SHED_READS {
+                1
+            } else if fill_eighths < BP_LOW {
+                0
+            } else {
+                bp
+            };
+            if new_bp != bp {
+                hdr.backpressure.store(new_bp, Ordering::Release);
             }
         }
     }

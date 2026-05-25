@@ -241,6 +241,15 @@ emit_bb_entry(void *drcontext, instrlist_t *bb, instr_t *where, app_pc bb_pc)
 
     drreg_reserve_aflags(drcontext, bb, where);
 
+    /* runtime phase gate: skip all BB_ENTRY traffic during BOOT.
+     * cmp [&g_phase], PHASE_TRACE; jne skip; 2 insns, predicted taken post transition */
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_cmp(drcontext,
+            opnd_create_abs_addr((void *)&g_phase, OPSZ_4),
+            OPND_CREATE_INT32(PHASE_TRACE)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jcc(drcontext, OP_jne, opnd_create_instr(skip_label)));
+
     /* ring null check */
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
@@ -439,6 +448,15 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
     instr_t *reentrant_skip = INSTR_CREATE_label(drcontext);
 
     drreg_reserve_aflags(drcontext, bb, where);
+
+    /* runtime phase gate: skip write instrumentation during BOOT.
+     * single cmp+jne on g_phase; predicted-taken after transition. */
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_cmp(drcontext,
+            opnd_create_abs_addr((void *)&g_phase, OPSZ_4),
+            OPND_CREATE_INT32(PHASE_TRACE)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jcc(drcontext, OP_jne, opnd_create_instr(skip_label)));
 
     /* EA -> pad.scratch[0] */
     instrlist_meta_preinsert(bb, where,
@@ -1063,6 +1081,7 @@ static inline uint64_t safe_read_value(uint64_t addr, uint32_t size) {
 static void
 at_mem_read_buf(uint64_t addr, uint32_t size)
 {
+    if (g_phase == PHASE_BOOT) return;
     void *drcontext = dr_get_current_drcontext();
     rtmap_ring_header_t *ring = tls_ring(drcontext);
     if (ring && atomic_load_explicit(&ring->backpressure, memory_order_relaxed)) {
@@ -1088,6 +1107,7 @@ static void flush_read_buf(void);
 static void
 flush_read_buf_if_needed(int needed)
 {
+    if (g_phase == PHASE_BOOT) return;
     void *drcontext = dr_get_current_drcontext();
     read_buf_t *buf = (read_buf_t *)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF]);
     if (!buf || (int)buf->count + needed <= RDBUF_CAP) return;
@@ -1097,6 +1117,7 @@ flush_read_buf_if_needed(int needed)
 static void
 flush_read_buf(void)
 {
+    if (g_phase == PHASE_BOOT) return;
     void *drcontext = dr_get_current_drcontext();
     void *guard = drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD]);
     if (guard != NULL) return;
@@ -1136,6 +1157,7 @@ flush_read_buf(void)
 static void
 at_call(uint64_t callee_pc, uint64_t frame_base)
 {
+    if (g_phase == PHASE_BOOT) return;
     void *drcontext = dr_get_current_drcontext();
     void *guard = drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD]);
     if (guard != NULL) return;
@@ -1187,6 +1209,7 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
 static void
 at_reload(uint64_t src_addr, uint32_t size, uint32_t dest_reg_idx)
 {
+    if (g_phase == PHASE_BOOT) return;
     void *drcontext = dr_get_current_drcontext();
     void *guard = drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD]);
     if (guard != NULL) return;
@@ -1243,6 +1266,7 @@ is_dwarf_reload_candidate(reg_id_t reg)
 static void
 at_return(uint64_t retaddr)
 {
+    if (g_phase == PHASE_BOOT) return;
     void *drcontext = dr_get_current_drcontext();
     void *guard = drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD]);
     if (guard != NULL) return;
@@ -1262,6 +1286,7 @@ at_return(uint64_t retaddr)
 static void
 at_tail_call(uint64_t target_pc, uint64_t frame_base)
 {
+    if (g_phase == PHASE_BOOT) return;
     void *drcontext = dr_get_current_drcontext();
     void *guard = drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD]);
     if (guard != NULL) return;
@@ -1326,10 +1351,11 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     if (!data->bb_emitted) {
         data->bb_emitted = true;
 
-        /* phase-delayed hydration: check tripwire on every BB entry during BOOT.
-         * cost during BOOT: one compare + conditional clean call per BB.
-         * cost during TRACE: one compare (branch-predicted not-taken). */
-        if (g_phase == PHASE_BOOT && g_tripwire_offset != 0 && g_module_base != 0) {
+        /* tripwire: emit clean call at the target BB during BOOT.
+         * only one BB matches; after tripwire_hit flips g_phase,
+         * the runtime phase gates in emit_bb_entry/emit_pre_write
+         * activate all instrumentation. */
+        if (g_tripwire_offset != 0 && g_module_base != 0) {
             uint64_t bb_off = (uint64_t)(ptr_uint_t)instr_get_app_pc(instr) - g_module_base;
             if (bb_off == g_tripwire_offset) {
                 dr_insert_clean_call(drcontext, bb, instr,
@@ -1337,19 +1363,12 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
             }
         }
 
-        /* during BOOT: skip everything; zero ring traffic, preserve budget */
-        if (g_phase == PHASE_BOOT) {
-            dr_thread_free(drcontext, data, sizeof(*data));
-            return DR_EMIT_DEFAULT;
-        }
-
+        /* always emit BB_ENTRY; runtime phase gate inside skips during BOOT */
         emit_bb_entry(drcontext, bb, instr, instr_get_app_pc(instr));
     }
 
-    /* all instrumentation below is PHASE_TRACE only */
-    if (g_phase == PHASE_BOOT) {
-        return DR_EMIT_DEFAULT;
-    }
+    /* all instrumentation emitted unconditionally; runtime g_phase checks
+     * inside clean calls and inline paths gate actual event production. */
 
     handle_pending_post_write(drcontext, bb, instr, data);
 
@@ -1970,6 +1989,51 @@ event_pre_syscall(void *drcontext, int sysnum)
     return true;
 }
 
+/* in-band shared mapping detection: intercept mmap/munmap to push
+ * EVENT_SHARED_MAP synchronously, eliminating /proc/maps TOCTOU. */
+static bool
+event_filter_syscall(void *drcontext, int sysnum)
+{
+    (void)drcontext;
+    return (sysnum == SYS_mmap || sysnum == SYS_munmap);
+}
+
+static void
+event_post_syscall(void *drcontext, int sysnum)
+{
+    if (g_phase == PHASE_BOOT) return;
+    if (sysnum == SYS_mmap) {
+        uint64_t ret = (uint64_t)dr_syscall_get_result(drcontext);
+        /* mmap returns -errno on failure (top bits set) */
+        if ((int64_t)ret < 0 && (int64_t)ret >= -4096) return;
+        int flags = (int)dr_syscall_get_param(drcontext, 3);
+        if (!(flags & MAP_SHARED)) return;
+        size_t length = (size_t)dr_syscall_get_param(drcontext, 1);
+        int fd = (int)dr_syscall_get_param(drcontext, 4);
+        rtmap_ring_header_t *ring = tls_ring(drcontext);
+        if (!ring) return;
+        uint16_t tid = tls_thread_id(drcontext);
+        uint32_t seq = tls_next_seq(drcontext);
+        /* addr=map_addr, size=fd, value=length; engine decodes */
+        rtmap_push_ex(ring, ret, (uint32_t)(fd & 0xFFFFFFFF), length,
+                       RTMAP_EVENT_SHARED_MAP, tid, seq);
+        sync_head_cache(drcontext);
+    } else if (sysnum == SYS_munmap) {
+        uint64_t addr = (uint64_t)dr_syscall_get_param(drcontext, 0);
+        size_t length = (size_t)dr_syscall_get_param(drcontext, 1);
+        uint64_t ret = (uint64_t)dr_syscall_get_result(drcontext);
+        if ((int64_t)ret != 0) return;
+        rtmap_ring_header_t *ring = tls_ring(drcontext);
+        if (!ring) return;
+        uint16_t tid = tls_thread_id(drcontext);
+        uint32_t seq = tls_next_seq(drcontext);
+        /* addr=unmap_addr, size=0xFFFFFFFF (sentinel), value=length */
+        rtmap_push_ex(ring, addr, 0xFFFFFFFF, length,
+                       RTMAP_EVENT_SHARED_MAP, tid, seq);
+        sync_head_cache(drcontext);
+    }
+}
+
 static void
 event_thread_exit(void *drcontext)
 {
@@ -2073,10 +2137,10 @@ static void tripwire_hit(void)
     g_phase = PHASE_TRACE;
     if (g_ctl)
         atomic_store_explicit(&g_ctl->tripwire_hit, 1, memory_order_release);
-    dr_printf("rtmap: TRIPWIRE HIT — phase transition BOOT->TRACE, flushing code cache\n");
-    /* dr_delay_flush_region: no lock restrictions, most performant flush.
-     * invalidates entire code cache; all BBs recompiled with full instrumentation. */
-    dr_delay_flush_region(0, (size_t)~0ULL, 0, NULL);
+    dr_printf("rtmap: TRIPWIRE HIT — phase transition BOOT->TRACE (no flush)\n");
+    /* runtime phase gates: all instrumentation was emitted at JIT time,
+     * gated by cmp [&g_phase], PHASE_TRACE; jne skip. flipping g_phase
+     * activates every existing fragment instantly — zero recompilation. */
 }
 
 DR_EXPORT void
@@ -2140,6 +2204,8 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     drmgr_register_thread_init_event(event_thread_init);
     drmgr_register_thread_exit_event(event_thread_exit);
     drmgr_register_pre_syscall_event(event_pre_syscall);
+    drmgr_register_filter_syscall_event(event_filter_syscall);
+    drmgr_register_post_syscall_event(event_post_syscall);
     dr_register_fork_init_event(event_fork_init);
 
     drmgr_register_bb_instrumentation_event(event_bb_analysis,

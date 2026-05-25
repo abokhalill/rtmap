@@ -29,6 +29,7 @@ pub const EVENT_FREE: u8 = 10;
 pub const EVENT_BB_ENTRY: u8 = 11;
 pub const EVENT_RELOAD: u8 = 12;
 pub const EVENT_PROCESS_FORK: u8 = 13;
+pub const EVENT_SHARED_MAP: u8 = 14;
 
 /// REG_SNAPSHOT is 7 contiguous ring slots (header + 6 continuations carrying
 /// regs[0..18] packed 3/slot). returns slots consumed: 7 on success, 1 on
@@ -79,6 +80,7 @@ pub fn process_event(
     heap_oracle: &mut HeapOracle,
     topo: &mut Option<TopologyStream>,
 ) -> bool {
+    world.total_event_count += 1;
     let ev_kind = ev.kind();
     match ev_kind {
         EVENT_WRITE => {
@@ -252,31 +254,43 @@ pub fn process_event(
                         .heap_allocs
                         .check_write_bounds(ev.addr, ev.size, &world.stm)
                     {
-                        let dominated = world
-                            .hazards
-                            .iter()
-                            .any(|prev| prev.write_addr == h.write_addr);
-                        if !dominated {
-                            h.pc = ev.rip_lo as u64;
-                            h.reg_snapshot = shadow_regs.get(&ev.thread_id).map(|srf| srf.values());
-                            if let Some(ref mut ts) = topo {
-                                let kind_str = match h.kind {
-                                    HazardKind::OutOfBounds => "OOB",
-                                    HazardKind::HeapHole => "HOLE",
-                                };
-                                ts.emit_hazard(
-                                    ev.seq32() as u64,
-                                    kind_str,
-                                    h.write_addr,
-                                    h.write_size,
-                                    h.alloc_base,
-                                    h.alloc_size,
-                                    h.overflow_bytes,
-                                    h.type_name.as_deref(),
-                                    h.field_name.as_deref(),
-                                );
+                        // suppress HeapHole within 256 events of any
+                        // ALLOC to avoid false positives from cross-thread ring
+                        // reordering (WRITE arrives before its ALLOC on a different ring).
+                        // OOB is never suppressed; it references a known allocation boundary.
+                        const HEAP_HOLE_GRACE: u64 = 256;
+                        if matches!(h.kind, HazardKind::HeapHole)
+                            && world.total_event_count.saturating_sub(world.last_alloc_event_count)
+                                < HEAP_HOLE_GRACE
+                        {
+                            // within grace window; discard probable false positive
+                        } else {
+                            let dominated = world
+                                .hazards
+                                .iter()
+                                .any(|prev| prev.write_addr == h.write_addr);
+                            if !dominated {
+                                h.pc = ev.rip_lo as u64;
+                                h.reg_snapshot = shadow_regs.get(&ev.thread_id).map(|srf| srf.values());
+                                if let Some(ref mut ts) = topo {
+                                    let kind_str = match h.kind {
+                                        HazardKind::OutOfBounds => "OOB",
+                                        HazardKind::HeapHole => "HOLE",
+                                    };
+                                    ts.emit_hazard(
+                                        ev.seq32() as u64,
+                                        kind_str,
+                                        h.write_addr,
+                                        h.write_size,
+                                        h.alloc_base,
+                                        h.alloc_size,
+                                        h.overflow_bytes,
+                                        h.type_name.as_deref(),
+                                        h.field_name.as_deref(),
+                                    );
+                                }
+                                world.hazards.push(h);
                             }
-                            world.hazards.push(h);
                         }
                     }
                 }
@@ -511,6 +525,7 @@ pub fn process_event(
             true
         }
         EVENT_ALLOC => {
+            world.last_alloc_event_count = world.total_event_count;
             let ptr = ev.addr;
             // ev.value carries full 64-bit size; ev.size is uint32_t (truncates >4GB)
             let size = if ev.value != 0 { ev.value } else { ev.size as u64 };
@@ -554,6 +569,26 @@ pub fn process_event(
                         }
                     }
                 }
+                // enrich with inlined subroutine PCs: if any caller_pc falls
+                // within an inlined function, add its low_pc so the oracle can
+                // match alloc-site signatures that originate from inlined callers.
+                // under -O3 aggressive inlining, the shadow stack has no CALL for
+                // inlined functions; this closes the oracle's blind spot.
+                {
+                    let base_len = caller_pcs.len();
+                    for i in 0..base_len {
+                        if caller_pcs.is_full() { break; }
+                        let pc = caller_pcs[i];
+                        // scan up to 3 preceding BTreeMap entries for overlapping inlines
+                        for (fpc, func) in info.functions.range(..=pc).rev().take(3) {
+                            if pc < func.high_pc && func.name.starts_with("[inlined]") {
+                                if !caller_pcs.contains(fpc) && !caller_pcs.is_full() {
+                                    caller_pcs.push(*fpc);
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(ti) = info.alloc_oracle.resolve(size, &caller_pcs).cloned() {
                     let source_pc = caller_pcs.first().copied().unwrap_or(0);
                     let source = format!("alloc@{:#x}", source_pc);
@@ -563,6 +598,11 @@ pub fn process_event(
                     let stamp_res = world.stm.stamp_type(ptr, &stamp_ti, &source, ev.seq32() as u64);
                     if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. } | StampResult::PoolReuse { .. }) {
                         orch.bloom_insert(ptr);
+                        // bloom-insert field offsets: protects initialization writes
+                        // from tiered backpressure shedding (BP=2)
+                        for field in &stamp_ti.fields {
+                            orch.bloom_insert(ptr + field.byte_offset);
+                        }
                         world.stm.replay_deferred(
                             ptr, stamp_ti.byte_size,
                             &info.type_registry, &world.heap_allocs,
@@ -668,6 +708,28 @@ pub fn process_event(
                 "rtmap: PROCESS_FORK child_pid={} parent_pid={}",
                 child_pid, parent_pid
             );
+            true
+        }
+        EVENT_SHARED_MAP => {
+            // in-band shared mapping notification from syscall hooks.
+            // size==0xFFFFFFFF sentinel = munmap; otherwise mmap.
+            let map_addr = ev.addr;
+            let length = ev.value;
+            let is_unmap = ev.size == 0xFFFFFFFF;
+            if is_unmap {
+                eprintln!(
+                    "rtmap: SHARED_UNMAP addr=0x{:x} len=0x{:x}",
+                    map_addr, length
+                );
+            } else {
+                let fd = ev.size as i32;
+                eprintln!(
+                    "rtmap: SHARED_MAP addr=0x{:x} len=0x{:x} fd={}",
+                    map_addr, length, fd
+                );
+            }
+            // engine's SharedIntervalMap updated by caller (main.rs)
+            // via world.shared_map_events; we just log here.
             true
         }
         _ => false,

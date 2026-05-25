@@ -1,15 +1,13 @@
 # rtmap
 
-Runtime memory topology analyzer for Linux x86-64. Instruments any unmodified
-binary via [DynamoRIO](https://dynamorio.org/), captures every memory write,
-read, function call, return, allocation, and basic-block entry, then correlates
-with DWARF debug information to produce a **named, structure-aware view** of
-heap layout, pointer topology, cacheline contention, and type stability —
-**without recompilation or source modification**.
+**Runtime Memory Topology Analyzer** for Linux x86-64.
 
-Verified against **nginx** (4.9M events, 1114 STM projections, pool/arena
-reuse classification), **Redis 8.0** (487-field `redisServer`, 120K+ pool
-reuse events correctly separated from 195 genuine schisms), and **jq**.
+Instruments any unmodified binary via [DynamoRIO](https://dynamorio.org/),
+captures every memory write, read, function call, return, allocation, and
+basic-block entry, then correlates with DWARF debug information to produce a
+**named, structure-aware view** of heap layout, pointer topology, cacheline
+contention, and type stability; all **without recompilation or source
+modification**.
 
 ## What You Get
 
@@ -60,15 +58,15 @@ cargo build --release --manifest-path engine/Cargo.toml
 # 2. Create a project profile (one-time per target)
 rtmap init /path/to/my_server                     # auto-detects tripwire, enables topology + heatmap
 
-# 3. Run — that's it
-rtmap run /path/to/my_server
+# 3. That's literally it
+rtmap /path/to/my_server
 ```
 
 For short-lived binaries (not servers), the profile step is optional:
 
 ```sh
 gcc -g examples/heap_chain.c -o heap_chain
-rtmap run ./heap_chain                            # headless snapshot, auto-exits on idle
+rtmap ./heap_chain                                # headless snapshot, auto-exits on idle
 ```
 
 ### Project Profiles (`.rtmap`)
@@ -87,8 +85,8 @@ target.nginx.heatmap = nginx.heatmap.tsv
 With a profile configured, every subsequent run is a single command:
 
 ```sh
-rtmap run /path/to/nginx                          # reads .rtmap, applies all settings
-rtmap run /path/to/nginx -- --override-flag       # CLI args after '--' replace profile args
+rtmap /path/to/nginx                              # reads .rtmap, applies all settings
+rtmap /path/to/nginx -- --override-flag           # CLI args after '--' replace profile args
 ```
 
 Resolution order: **CLI flags > `.rtmap` project > `~/.config/rtmap/config` > auto-detect**.
@@ -116,9 +114,9 @@ topology snapshot. Headless by default; `--live` enables a 20 Hz interactive
 TUI with time-travel.
 
 ```sh
-rtmap run ./my_program                        # headless snapshot
-rtmap run ./my_program --live                 # interactive TUI
-rtmap run ./my_program --topology topo.jsonl  # export structural graph
+rtmap ./my_program                            # headless snapshot
+rtmap ./my_program --live                     # interactive TUI
+rtmap ./my_program --topology topo.jsonl      # export structural graph
 rtmap record -o trace.bin ./my_program        # record for offline analysis
 rtmap replay trace.bin --dwarf ./my_program
 ```
@@ -130,13 +128,15 @@ tracing until the server's event loop starts, then auto-exits after traffic
 stops:
 
 ```sh
-rtmap run --tripwire aeProcessEvents /path/to/redis-server --port 6399
+rtmap --tripwire aeProcessEvents /path/to/redis-server -- --port 6399
 ```
 
 The tripwire is auto-detected by `rtmap init` for common servers. The engine
 arms its idle timeout only after the tracer confirms the tripwire has fired
 (via an atomic flag in shared memory), preventing premature exit during
-DynamoRIO's JIT compilation phase.
+startup. No code cache flush occurs on transition — the tracer uses a
+runtime phase gate (`cmp [g_phase], PHASE_TRACE; jne skip`) that activates
+instantly when the tripwire fires.
 
 ### `rtmap-lint` — static false-sharing detector
 
@@ -191,11 +191,15 @@ and assertion DSL.
  │  tracer.c                 │  tripwire_hit  │  rtmap       main.rs  (live)      │
  │  rtmap_bridge.h           │   (atomic)     │  rtmap-lint  lint.rs  (static)    │
  │                           │                │  rtmap-diff  diff.rs  (offline)   │
- │  phase-delayed JIT:       │                │  rtmap-check check.rs (CI/CD)     │
- │  BOOT → tripwire → TRACE  │                │                                   │
- │                           │                │  config.rs     (.rtmap profiles)  │
- │  fork → child gets own    │                │  reconciler.rs (event dispatch)   │
- │  PID-scoped ctl + rings   │                │  world.rs      (STM, pool_reuse)  │
+ │  runtime phase gate:      │                │  rtmap-check check.rs (CI/CD)     │
+ │ BOOT -> tripwire -> TRACE │                │                                   │
+ │  (no code cache flush)    │                │  reconciler.rs (event dispatch)   │
+ │                           │                │  world.rs      (STM, Visual ASan) │
+ │  tiered backpressure:     │                │  dwarf.rs      (DWARF + CFI)      │
+ │  BP=0/1/2, bloom-gated    │                │  heap_graph.rs (pointer topology) │
+ │                           │                │                                   │
+ │  fork -> child gets own   │                │                                   │
+ │  PID-scoped ctl + rings   │                │                                   │
  └───────────────────────────┘                └───────────────────────────────────┘
        runs inside target's                         separate process
        address space (+ forks)
@@ -217,6 +221,7 @@ and assertion DSL.
 | `ABI MISMATCH` | Tracer and engine built from different `rtmap_bridge.h` | Rebuild both from the same source |
 | Premature exit on server | Tripwire not set or not found | Use `rtmap init <target>` to auto-detect, or `--tripwire <symbol>` |
 | Docker permission denied | Missing ptrace capability | Add `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` |
+| `seq_gaps > 0` | Ring overflow — too many events | Add `--no-bb` to reduce volume, or increase ring capacity |
 
 </details>
 

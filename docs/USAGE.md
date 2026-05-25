@@ -39,28 +39,28 @@ Resolution order: **CLI flags > `.rtmap` project > `~/.config/rtmap/config` > au
 
 ```sh
 # headless (default): print snapshot to stdout, exit on idle
-rtmap run ./my_program [args...]
+rtmap ./my_program [-- target_args...]
 
 # interactive TUI (20 Hz refresh, time-travel, 6 panels)
-rtmap run ./my_program --live [args...]
+rtmap ./my_program --live
 
 # server mode: defer tracing until event loop starts, auto-exit after traffic
-rtmap run --tripwire aeProcessEvents ./redis-server --port 6399
+rtmap --tripwire aeProcessEvents ./redis-server -- --port 6399
 
 # with project profile (reads .rtmap, no flags needed)
-rtmap run ./my_server
+rtmap ./my_server
 
 # override profile args on CLI
-rtmap run ./my_server -- --port 7399
+rtmap ./my_server -- --port 7399
 
 # record events for offline analysis
 rtmap record -o trace.bin ./my_program
 
 # export topology, heatmap, and BB coverage
-rtmap run ./my_program --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
+rtmap ./my_program --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
 
 # skip BB_ENTRY events (reduces ring volume, no topology impact)
-rtmap run ./my_program --no-bb
+rtmap ./my_program --no-bb
 ```
 
 ### Replay

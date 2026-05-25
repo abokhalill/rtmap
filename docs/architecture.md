@@ -69,6 +69,40 @@ is published to a PID-scoped control ring (`/rtmap_ctl_<pid>`). The root
 process also creates a legacy `/rtmap_ctl` for backward compatibility.
 See [Ring Protocol](ring-protocol.md).
 
+#### Runtime phase gate
+
+The tracer operates in two phases (`g_phase`):
+
+| Phase | Name | Behavior |
+|---|---|---|
+| `PHASE_BOOT` | DBI startup | All instrumentation is **emitted at JIT time** but **gated at runtime** via an inline `cmp [g_phase], PHASE_TRACE; jne skip` at the top of `emit_bb_entry` and `emit_pre_write`. Only ALLOC/FREE (clean-call hooks check `g_phase` at entry) pass through. |
+| `PHASE_TRACE` | Full tracing | The runtime gate falls through (predicted-taken). All event types flow. **No code cache invalidation occurs.** |
+
+Transition in `tripwire_hit()`: set `g_phase = PHASE_TRACE` (relaxed store),
+then `g_ctl->tripwire_hit = 1` (release). Zero code cache flush — the inline
+gate observes the new phase on the next BB entry without recompilation.
+
+#### Tiered backpressure
+
+Three levels communicated from engine to tracer via the ring header's
+`bp_level` field:
+
+| Level | Threshold | Behavior |
+|---|---|---|
+| 0 | Ring < 6/8 full | All events emitted |
+| 1 | Ring ≥ 6/8 full | READ and BB_ENTRY suppressed |
+| 2 | Ring ≥ 7/8 full | Only ALLOC, FREE, and bloom-gated writes survive |
+
+Hysteresis: clears at 3/8. The bloom filter is populated per stamped
+allocation's fields (`alloc_base + field_offset`), ensuring initialization
+writes to typed heap survive BP=2.
+
+#### In-band syscall hooks
+
+`EVENT_SHARED_MAP` (kind 14) emits mmap/munmap notifications in-band via
+`drmgr_register_filter_syscall_event` + `drmgr_register_post_syscall_event`.
+Eliminates races from polling `/proc/<pid>/maps` for shared region discovery.
+
 ### Engine (`engine/`)
 
 The engine is the consumer process. Its subsystems are organized into library

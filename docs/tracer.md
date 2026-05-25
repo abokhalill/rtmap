@@ -26,31 +26,34 @@ The tracer entry point is `dr_client_main()`. It performs the following steps:
 6. If a tripwire ELF offset was passed by the engine (first argument to the
    client), arms the tripwire breakpoint via `dr_register_bb_event` filtering.
 
-### Tripwire mechanism
+### Tripwire mechanism (runtime phase gate)
 
-The tracer supports a **phase-delayed JIT** model for server-mode targets.
+The tracer supports a **runtime phase gate** for server-mode targets.
 The engine resolves a tripwire symbol (e.g., `ngx_epoll_process_events`,
 `aeProcessEvents`) to an ELF offset and passes it as the first client
 argument. The tracer operates in two phases:
 
 | Phase | Name | Behavior |
 |---|---|---|
-| `PHASE_BOOT` | DBI startup | Only ALLOC/FREE events emitted. WRITE/READ/CALL suppressed. |
-| `PHASE_TRACE` | Full tracing | All event types emitted. Code cache flushed and recompiled. |
+| `PHASE_BOOT` | DBI startup | All instrumentation is **emitted at JIT time** but **gated at runtime** by an inline `cmp [g_phase], PHASE_TRACE; jne skip` at the top of each instrumented path. Only ALLOC/FREE (via clean-call hooks that check `g_phase` at entry) pass through. |
+| `PHASE_TRACE` | Full tracing | The runtime gate falls through (predicted-taken). All event types flow. No code cache invalidation occurs. |
 
 The transition occurs in `tripwire_hit()`:
 
 1. Guard: if `g_phase != PHASE_BOOT`, return (idempotent).
-2. Set `g_phase = PHASE_TRACE`.
+2. Set `g_phase = PHASE_TRACE` (relaxed store; the inline compare will
+   observe the new value on the next BB entry).
 3. Atomically set `g_ctl->tripwire_hit = 1` with release semantics.
-4. Call `dr_delay_flush_region(0, ~0, 0, NULL)` — invalidates the entire
-   code cache, forcing all basic blocks to be recompiled with full
-   instrumentation.
+
+**No code cache flush.** Because all instrumentation was emitted during
+PHASE_BOOT (gated by the runtime check), the transition from BOOT→TRACE
+requires zero JIT recompilation. This eliminates the multi-second code cache
+flush storm that previously occurred on tripwire fire in large binaries
+(e.g., Redis with ~15K basic blocks).
 
 The engine reads `tripwire_hit` from the shared ctl header (relaxed load)
-to arm its idle timeout. This prevents premature exit during the
-multi-second DBI JIT compilation pause between `PHASE_BOOT` and
-`PHASE_TRACE`.
+to arm its idle timeout. This prevents premature exit during the startup
+pause before the server's event loop begins.
 
 ### drmgr TLS fields
 

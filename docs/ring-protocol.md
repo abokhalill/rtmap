@@ -91,6 +91,26 @@ for both formats.
 | `FREE` | 10 | Pointer freed | 0 | 0 | `drwrap` pre-free / pre-realloc(old) |
 | `BB_ENTRY` | 11 | BB start PC | 0 | 0 | Fully inline, main module only. Shed under backpressure. |
 | `RELOAD` | 12 | Source address | Load size | Register index | MOV to callee-saved |
+| `PROCESS_FORK` | 13 | Child PID | 0 | Parent PID | Emitted by child after `fork()` |
+| `SHARED_MAP` | 14 | Map address | Map length | Flags (MAP/UNMAP) | In-band `mmap`/`munmap` notification |
+
+### Backpressure levels
+
+The ring protocol defines three backpressure levels, communicated from engine
+to tracer via the `bp_level` field in the per-thread ring header:
+
+| Level | Threshold | Behavior |
+|---|---|---|
+| 0 (normal) | Ring < 6/8 full | All events emitted |
+| 1 (shed reads) | Ring ≥ 6/8 full | READ and BB_ENTRY events suppressed |
+| 2 (shed non-bloom) | Ring ≥ 7/8 full | All events suppressed EXCEPT: ALLOC, FREE, and writes whose `(addr + field_offset)` is present in the per-ring bloom filter |
+
+Hysteresis: backpressure clears only when occupancy drops below 3/8.
+
+The bloom filter is populated by the engine when it stamps a heap allocation:
+for each field in the type projection, `bloom_insert(alloc_base + field_offset)`.
+This ensures that initialization writes to freshly-typed heap memory survive
+even the highest backpressure level.
 
 ### Compound wide writes
 

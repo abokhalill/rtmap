@@ -548,6 +548,22 @@ against the projected type's field layout. On the WRITE hot path, the
 reconciler reuses the `covering()` result already computed for the field
 heatmap — no additional O(N) scan.
 
+### SIMD-scaled tail tolerance
+
+The `check_write` function applies a **write-size-scaled tail tolerance**
+before reporting Spanning violations. This eliminates false positives from
+AVX2/AVX-512 coalesced stores that spill past the last declared field:
+
+| Write size | Tolerance | Rationale |
+|---|---|---|
+| ≥ 64 bytes | 56 bytes | AVX-512: 64B store across last 8B field → 56B overshoot |
+| ≥ 32 bytes | 24 bytes | AVX2: 32B store across last 8B field → 24B overshoot |
+| ≥ 16 bytes | 8 bytes | SSE: 16B store across last 8B field → 8B overshoot |
+| < 16 bytes | 0 bytes | Scalar: no tolerance (exact field match required) |
+
+The tolerance is applied only to the **last field** of a struct (tail spill).
+Interior field boundary violations are always reported regardless of write size.
+
 ### Violation classes
 
 | Kind | Condition | Signal |
@@ -644,6 +660,24 @@ output like:
 ```
 OOB  0x...40 +8B exceeds alloc [0x...20..+24] by 8B (intended for node_t.next)
 ```
+
+### HeapHole grace period
+
+HeapHole hazards are suppressed within **256 events** of the last ALLOC event
+(`world.total_event_count - world.last_alloc_event_count <= 256`). This
+eliminates false-positive HeapHole reports caused by cross-thread ring
+reordering: when thread A's ALLOC and thread B's WRITE to the freshly-
+allocated memory are consumed in WRITE-first order, the engine would
+otherwise report a HeapHole (write to unallocated memory) that is merely
+an artifact of ring consumption order.
+
+**OOB hazards are never suppressed** — they reference a known allocation
+boundary and cannot be caused by reordering.
+
+The grace period is zero-allocation, zero-copy, and branch-predicted-taken
+(HeapHoles are rare in correct programs). Fields:
+- `world.total_event_count`: incremented at the top of `process_event`.
+- `world.last_alloc_event_count`: stamped on every ALLOC event.
 
 ### Heap-hole filtering
 
@@ -843,10 +877,30 @@ live engine and `rtmap-diff`. Public API:
 | `CACHE_MISS` (6) | `addr_index.lookup`. Record miss in `cache_heat`. |
 | `MODULE_LOAD` (7) | Compute relocation delta. Re-populate globals with relocated addresses. Register heap oracle module range. |
 | `TAIL_CALL` (8) | Like CALL but does not push a new shadow frame (replaces current). |
-| `ALLOC` (9) | `heap_allocs.on_alloc(ptr, size)`. Size read from `ev.size` (32-bit). |
+| `ALLOC` (9) | `heap_allocs.on_alloc(ptr, size)`. Size read from `ev.size` (32-bit). Stamps `world.last_alloc_event_count = world.total_event_count` for HeapHole grace period. |
 | `FREE` (10) | `heap_allocs.on_free(ptr)`. If matched: `stm.purge_range` + `heap_graph.on_free`. If orphan: count only, no purge. |
 | `RELOAD` (12) | `shadow_regs.on_reload(reg, value, src_addr, size, seq, rip)`. |
 | `PROCESS_FORK` (13) | Log child/parent PID. `ChildProcessTracker::register_fork(child_pid)`. |
+| `SHARED_MAP` (14) | Log mmap/munmap address and length. Used by `ChildProcessTracker` to refresh shared region map without polling `/proc/<pid>/maps`. |
+
+### Inline-aware caller_pcs enrichment
+
+In the `ALLOC` handler, after building `caller_pcs` from `ev.rip_lo` and
+the shadow stack, the reconciler enriches the set with inlined subroutine
+PCs. For each caller PC, it queries `dwarf_info.functions` (a `BTreeMap<u64,
+FunctionMeta>`) for overlapping inlined subroutines. If the caller PC falls
+within an inlined function's `[low_pc, high_pc)` range, that function's
+`low_pc` is added to `caller_pcs`.
+
+This closes the AllocSiteOracle blind spot under `-O3` aggressive inlining:
+when a function is inlined, no CALL event (and thus no shadow stack frame)
+exists for it. Without enrichment, the oracle cannot match the allocation
+signature. With enrichment, the inlined caller's low_pc appears in
+`caller_pcs` and the oracle matches correctly.
+
+**Impact**: Redis at `-O3` achieves 46 STM projections with enrichment vs
+~12 without (type coverage gap from inlined allocator wrappers like
+`zmalloc` → `malloc`).
 
 Returns `true` if the event was "interesting" (tracked write or control
 event). Untracked writes return `false` and are not journaled (~90% of
@@ -1260,7 +1314,7 @@ Exit code 1 if any warnings are emitted (CI/CD gatekeeper).
 
 ## Startup sequence
 
-Full startup when the user runs `rtmap run <target>`:
+Full startup when the user runs `rtmap <target>`:
 
 1. Parse CLI: subcommand routing (`setup`, `init`, `record`, `replay`,
    `attach`, or default `run`). Legacy flags (`--once`, `--record`,

@@ -42,6 +42,7 @@
 #define RTMAP_EVENT_BB_ENTRY    11
 #define RTMAP_EVENT_RELOAD      12
 #define RTMAP_EVENT_PROCESS_FORK 13
+#define RTMAP_EVENT_SHARED_MAP   14
 
 #define RTMAP_REG_SNAPSHOT_SLOTS 7
 
@@ -65,8 +66,9 @@
 #define RTMAP_REG_RFLAGS 17
 #define RTMAP_REG_COUNT 18
 
-#define RTMAP_BP_HIGH_WATER  6  /* 6/8 capacity */
 #define RTMAP_BP_LOW_WATER   3
+#define RTMAP_BP_SHED_READS  6  /* 6/8: shed reads + bb_entry */
+#define RTMAP_BP_SHED_WRITES 7  /* 7/8: shed non-bloom writes */
 
 #define RTMAP_BLOOM_U64S    512   /* 4KB = 32768 bits */
 #define RTMAP_BLOOM_BITS    (RTMAP_BLOOM_U64S * 64)

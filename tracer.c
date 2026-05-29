@@ -123,6 +123,17 @@ static volatile int g_phase = PHASE_TRACE;  /* default: full trace (no tripwire)
 static uint64_t g_tripwire_offset = 0;      /* ELF offset from client argv */
 static void tripwire_hit(void);
 
+/* This is custom arena/pool sub allocators (e.g. ngx_palloc, palloc, do_item_alloc etc.).
+ * Its parsed from client argv after the tripwire offset; resolved to func_pc at main-module load. */
+#define ARENA_MAX 16
+typedef struct {
+    uint64_t offset;   
+    int      size_arg; 
+    app_pc   func_pc;  
+} arena_spec_t;
+static arena_spec_t g_arena_specs[ARENA_MAX];
+static int g_arena_spec_count = 0;
+
 /* sidecar module table: written to /dev/shm/rtmap_modules_<pid> */
 #define MODTAB_MAX 64
 static struct { uint64_t base; char path[256]; } g_modtab[MODTAB_MAX];
@@ -1619,6 +1630,20 @@ wrap_malloc_pre(void *wrapctx, void **user_data)
 }
 
 static void
+wrap_arena_alloc_pre(void *wrapctx, void **user_data)
+{
+    app_pc f = drwrap_get_func(wrapctx);
+    int size_arg = 0;
+    for (int i = 0; i < g_arena_spec_count; i++) {
+        if (g_arena_specs[i].func_pc == f) {
+            size_arg = g_arena_specs[i].size_arg;
+            break;
+        }
+    }
+    *user_data = (void *)(uintptr_t)drwrap_get_arg(wrapctx, size_arg);
+}
+
+static void
 wrap_malloc_post(void *wrapctx, void *user_data)
 {
     void *ret = drwrap_get_retval(wrapctx);
@@ -1860,6 +1885,17 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
             atomic_store_explicit(&g_module_base_phase, 1, memory_order_release);
             dr_printf("rtmap: main module '%s' base=0x%llx\n",
                       name, (unsigned long long)g_module_base);
+
+            /* resolve + wrap custom arena sub-allocators by ELF offset.
+             * func_pc = main module base + offset. share wrap_malloc_post. */
+            for (int i = 0; i < g_arena_spec_count; i++) {
+                app_pc fpc = info->start + g_arena_specs[i].offset;
+                g_arena_specs[i].func_pc = fpc;
+                drwrap_wrap(fpc, wrap_arena_alloc_pre, wrap_malloc_post);
+                dr_printf("rtmap: wrapped arena allocator @ ELF+0x%llx (size_arg=%d) in %s\n",
+                          (unsigned long long)g_arena_specs[i].offset,
+                          g_arena_specs[i].size_arg, name);
+            }
         }
     }
 }
@@ -2149,7 +2185,9 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     (void)id;
 
     /* parse client args: argv[0] is client lib path, argv[1..] are our args.
-     * first real arg is hex tripwire ELF offset (0 = disabled). */
+     * argv[1] is hex tripwire ELF offset (0 = disabled).
+     * argv[2..] are arena allocator specs formatted "<hex_offset>:<size_arg>"
+     * (e.g. "3a2b0:1" for ngx_palloc(pool, size)). */
     if (argc >= 2 && argv[1] != NULL) {
         char *end = NULL;
         uint64_t off = (uint64_t)strtoull(argv[1], &end, 16);
@@ -2159,6 +2197,28 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
             dr_printf("rtmap: tripwire armed at ELF+0x%llx (PHASE_BOOT)\n",
                       (unsigned long long)off);
         }
+    }
+    for (int ai = 2; ai < argc && argv[ai] != NULL; ai++) {
+        if (g_arena_spec_count >= ARENA_MAX) {
+            dr_printf("rtmap: WARNING: too many arena allocator specs (max %d)\n",
+                      ARENA_MAX);
+            break;
+        }
+        char *colon = NULL;
+        uint64_t aoff = (uint64_t)strtoull(argv[ai], &colon, 16);
+        if (colon == argv[ai] || *colon != ':') {
+            dr_printf("rtmap: WARNING: malformed arena spec '%s' (want <hexoff>:<argidx>)\n",
+                      argv[ai]);
+            continue;
+        }
+        int sarg = (int)strtol(colon + 1, NULL, 10);
+        if (sarg < 0 || sarg > 8) sarg = 0;
+        g_arena_specs[g_arena_spec_count].offset   = aoff;
+        g_arena_specs[g_arena_spec_count].size_arg = sarg;
+        g_arena_specs[g_arena_spec_count].func_pc  = NULL;
+        g_arena_spec_count++;
+        dr_printf("rtmap: arena allocator spec: ELF+0x%llx size_arg=%d\n",
+                  (unsigned long long)aoff, sarg);
     }
 
     dr_set_client_name("rtmap tracer", "https://github.com/abokhalill/rtmap");

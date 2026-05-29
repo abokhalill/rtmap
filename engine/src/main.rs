@@ -26,10 +26,9 @@ struct RunConfig {
     coverage_path: Option<String>,
     no_bb: bool,
     tripwire_symbol: Option<String>,
+    alloc_fns: Vec<(String, u32)>,
 }
 
-/// seq domain: JIT-inlined events (WRITE/BB_ENTRY) use raw TLS seq counter,
-/// clean-call events (CALL/RET/ALLOC/FREE/REG_SNAPSHOT/etc.) use drmgr TLS seq.
 #[inline(always)]
 fn seq_domain(ev_kind: u8) -> u8 {
     match ev_kind {
@@ -38,7 +37,6 @@ fn seq_domain(ev_kind: u8) -> u8 {
     }
 }
 
-/// sorted (start, end, region_index) intervals for O(log N) shared-addr lookup
 struct SharedIntervalMap {
     /// sorted by start address; non-overlapping after merge
     intervals: Vec<(u64, u64, usize)>,
@@ -59,7 +57,6 @@ impl SharedIntervalMap {
         self.intervals.sort_unstable_by_key(|&(s, _, _)| s);
     }
 
-    /// O(log N) lookup: binary search for the interval containing addr
     #[inline]
     fn lookup(&self, addr: u64) -> Option<usize> {
         let idx = self.intervals.partition_point(|&(s, _, _)| s <= addr);
@@ -1085,16 +1082,22 @@ fn run_headless(
 
             let tracer_gone = TRACER_EXITED.load(AtomicOrdering::Relaxed);
 
-            // server mode: arm when tracer confirms tripwire hit via ctl shm,
-            // or fall back to STM engagement for offline/no-tripwire targets.
-            // tracer death always triggers immediate exit.
+            // We deliberately do NOT arm on world.stm.len() (boot-time warm-scan
+            // stamps globals before any query), which previously caused the idle
+            // timer to expire during slow DBI startup while the parent sat idle
+            // in select(). tracer death always triggers immediate exit.
             let idle_limit = if server_mode { 200 } else { 50 };
             let armed = if server_mode {
-                orch.tripwire_hit() || world.stm.len() > 0
+                orch.tripwire_hit() || child_tracker.child_count() > 0
             } else {
                 *total > 0
             };
-            if tracer_gone || (armed && idle_rounds >= idle_limit) {
+            // Don't auto-exit on idle while any child process is
+            // still alive; rely on SIGINT or tracer death to terminate. This
+            // prevents premature exit during slow DBI startup when the parent
+            // sits in select() producing no instrumented writes.
+            let children_alive = server_mode && child_tracker.child_count() > 0;
+            if tracer_gone || (!children_alive && armed && idle_rounds >= idle_limit) {
                 // final ring discovery sweep: catch rings from short-lived
                 // threads that spawned and died between poll intervals.
                 orch.poll_new_rings();
@@ -2266,12 +2269,31 @@ fn launch(target: &str, target_args: &[String], cfg: RunConfig, resolved_cfg: &r
         resolve_elf_symbol_offset(target, sym)
     });
 
+    // resolve arena/pool sub-allocator symbols to ELF offsets.
+    let arena_specs: Vec<String> = cfg.alloc_fns.iter().filter_map(|(sym, arg)| {
+        match resolve_elf_symbol_offset(target, sym) {
+            Some(off) => {
+                eprintln!("rtmap: arena allocator '{}' at ELF offset 0x{:x} (size_arg={})",
+                          sym, off, arg);
+                Some(format!("{:x}:{}", off, arg))
+            }
+            None => None,
+        }
+    }).collect();
+
     let mut cmd = std::process::Command::new(&drrun);
     cmd.arg("-c").arg(&tracer);
+    // argv[1] must always be the tripwire offset (0 = disabled) so that
+    // arena specs in argv[2..] keep their positional meaning.
     if let Some(off) = tripwire_offset {
         cmd.arg(format!("{:x}", off));
         eprintln!("rtmap: tripwire '{}' at ELF offset 0x{:x}",
                   cfg.tripwire_symbol.as_deref().unwrap_or("?"), off);
+    } else if !arena_specs.is_empty() {
+        cmd.arg("0");
+    }
+    for spec in &arena_specs {
+        cmd.arg(spec);
     }
     cmd.arg("--").arg(target);
     for a in target_args {
@@ -2374,6 +2396,9 @@ fn print_help_advanced() {
     eprintln!();
     eprintln!("INSTRUMENTATION:");
     eprintln!("  --tripwire <sym>       Defer tracing until function <sym> is entered");
+    eprintln!("  --alloc-fn <sym>[:<n>] Treat <sym> as an arena/pool allocator; size is arg n");
+    eprintln!("                         (default 0). Repeatable. Recovers object boundaries");
+    eprintln!("                         for malloc-bypassing allocators");
     eprintln!("  --no-bb                Skip BB_ENTRY events (reduces ring buffer volume)");
     eprintln!("  --min-events <N>       Minimum events before snapshot (default: 1)");
     eprintln!("  --dr-home <path>       Explicit DynamoRIO installation (overrides config/env)");
@@ -2504,6 +2529,19 @@ fn parse_common_flags(args: &mut Vec<String>) -> RunConfig {
     take_flag(args, "--once");
     let no_bb = take_flag(args, "--no-bb");
     let tripwire_symbol = take_flag_value(args, "--tripwire");
+    // --alloc-fn <sym>[:<size_arg>] is repeatable; size_arg defaults to 0.
+    let mut alloc_fns: Vec<(String, u32)> = Vec::new();
+    while let Some(spec) = take_flag_value(args, "--alloc-fn") {
+        let (sym, arg) = match spec.split_once(':') {
+            Some((s, a)) => (s.to_string(), a.parse::<u32>().unwrap_or(0)),
+            None => (spec, 0),
+        };
+        if sym.is_empty() {
+            eprintln!("rtmap: warning: ignoring empty --alloc-fn spec");
+            continue;
+        }
+        alloc_fns.push((sym, arg));
+    }
     RunConfig {
         once: !live,
         server_mode: tripwire_symbol.is_some(),
@@ -2517,6 +2555,7 @@ fn parse_common_flags(args: &mut Vec<String>) -> RunConfig {
         coverage_path: take_flag_value(args, "--coverage"),
         no_bb,
         tripwire_symbol,
+        alloc_fns,
     }
 }
 

@@ -1082,8 +1082,7 @@ fn run_headless(
 
             let tracer_gone = TRACER_EXITED.load(AtomicOrdering::Relaxed);
 
-            // We deliberately do NOT arm on world.stm.len() (boot-time warm-scan
-            // stamps globals before any query), which previously caused the idle
+            // We deliberately do NOT arm on world.stm.len(), which previously caused the idle
             // timer to expire during slow DBI startup while the parent sat idle
             // in select(). tracer death always triggers immediate exit.
             let idle_limit = if server_mode { 200 } else { 50 };

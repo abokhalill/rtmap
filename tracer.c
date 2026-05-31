@@ -65,6 +65,7 @@ _Static_assert(offsetof(rtmap_ring_header_t, tail) == 2 * RTMAP_CACHE_LINE, "rin
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -1646,6 +1647,10 @@ wrap_arena_alloc_pre(void *wrapctx, void **user_data)
 static void
 wrap_malloc_post(void *wrapctx, void *user_data)
 {
+    /* drwrap invokes post-callbacks with wrapctx==NULL when an abnormal stack
+     * unwind bypassed the wrapped function's return. There is no allocation to
+     * record in that case; touching wrapctx would dereference NULL. */
+    if (wrapctx == NULL) return;
     void *ret = drwrap_get_retval(wrapctx);
     if (ret == NULL) return;
     uint64_t ptr  = (uint64_t)(uintptr_t)ret;
@@ -1696,6 +1701,8 @@ wrap_realloc_pre(void *wrapctx, void **user_data)
 static void
 wrap_realloc_post(void *wrapctx, void *user_data)
 {
+    /* NULL wrapctx => abnormal unwind bypassed the return (see wrap_malloc_post) */
+    if (wrapctx == NULL) return;
     void *ret = drwrap_get_retval(wrapctx);
     if (ret == NULL) return;
     uint64_t ptr  = (uint64_t)(uintptr_t)ret;
@@ -1891,7 +1898,9 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
             for (int i = 0; i < g_arena_spec_count; i++) {
                 app_pc fpc = info->start + g_arena_specs[i].offset;
                 g_arena_specs[i].func_pc = fpc;
-                drwrap_wrap(fpc, wrap_arena_alloc_pre, wrap_malloc_post);
+                drwrap_wrap_ex(fpc, wrap_arena_alloc_pre, wrap_malloc_post,
+                               NULL,
+                               DRWRAP_UNWIND_ON_EXCEPTION | DRWRAP_CALLCONV_DEFAULT);
                 dr_printf("rtmap: wrapped arena allocator @ ELF+0x%llx (size_arg=%d) in %s\n",
                           (unsigned long long)g_arena_specs[i].offset,
                           g_arena_specs[i].size_arg, name);
@@ -1933,22 +1942,32 @@ event_fork_init(void *drcontext)
         munmap(old_ring, rtmap_shm_size(old_ring->capacity));
     }
 
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_SEQ], (void *)(uintptr_t)0);
+
     char name[RTMAP_RING_NAME_LEN];
     dr_snprintf(name, sizeof(name), RTMAP_RING_SHM_FMT,
                 (unsigned)g_process_pid, (unsigned)tid);
     rtmap_ring_header_t *ring = alloc_thread_ring(name);
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING], (void *)ring);
 
-    /* update raw TLS and pad */
-    rtmap_scratch_pad_t *pad = tls_pad(drcontext);
-    if (pad && ring) {
-        pad->ring_data = (uint64_t)(uintptr_t)rtmap_ring_data(ring);
-        pad->ring_mask = ring->capacity - 1;
-    }
+    /* The child inherited the parent thread's read buffer and scratch pad
+     * pointers via dr_thread_alloc memory that is NOT valid in the child's
+     * DR context. Allocate fresh per-thread state and repopulate ALL raw TLS
+     * slots exactly as event_thread_init does.*/
+    read_buf_t *rdbuf = (read_buf_t *)dr_thread_alloc(drcontext, sizeof(read_buf_t));
+    memset(rdbuf, 0, sizeof(read_buf_t));
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF], (void *)rdbuf);
+
+    rtmap_scratch_pad_t *pad = alloc_scratch_pad(drcontext, ring);
     raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_RING), (void *)ring);
     raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_HEAD), (void *)(uintptr_t)0);
     raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_SEQ), (void *)(uintptr_t)0);
     raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_TID), (void *)(uintptr_t)tid);
+    raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_BP), (void *)(uintptr_t)0);
+    raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_SCRATCH), (void *)pad);
+    raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_RDBUF), (void *)rdbuf);
+    raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_GUARD), NULL);
 
     int ctl_idx = -1;
     if (ring && g_ctl)
@@ -1966,6 +1985,48 @@ event_fork_init(void *drcontext)
 
     dr_printf("rtmap: fork child pid=%u parent=%u ring @ %p (%s)\n",
               (unsigned)child, (unsigned)parent, (void *)ring, name);
+}
+
+static _Atomic uint64_t g_fastpath_faults = 0;
+
+/* Instrumentation fast path fault recovery. */
+static dr_signal_action_t
+event_signal_fastpath_recover(void *drcontext, dr_siginfo_t *si)
+{
+    if (si->sig != SIGSEGV && si->sig != SIGBUS)
+        return DR_SIGNAL_DELIVER;
+    /* Only recover faults originating in our own instrumentation. DR sets a
+     * NULL translated PC for meta-instructions that have no app counterpart. */
+    if (!si->raw_mcontext_valid || si->raw_mcontext == NULL)
+        return DR_SIGNAL_DELIVER;
+    if (si->mcontext != NULL && si->mcontext->pc != NULL)
+        return DR_SIGNAL_DELIVER; /* genuine application fault */
+
+    byte *pc = (byte *)si->raw_mcontext->pc;
+    if (pc == NULL)
+        return DR_SIGNAL_DELIVER;
+
+    instr_t insn;
+    instr_init(drcontext, &insn);
+    byte *next = decode(drcontext, pc, &insn);
+    if (next == NULL) {
+        instr_free(drcontext, &insn);
+        return DR_SIGNAL_DELIVER; /* cannot decode: be conservative */
+    }
+    /* zero every register destination so the captured value is benign (0)
+     * rather than garbage, then skip the faulting instruction. */
+    for (int i = 0; i < instr_num_dsts(&insn); i++) {
+        opnd_t d = instr_get_dst(&insn, i);
+        if (opnd_is_reg(d)) {
+            reg_id_t r = opnd_get_reg(d);
+            if (reg_is_gpr(r))
+                reg_set_value(reg_to_pointer_sized(r), si->raw_mcontext, 0);
+        }
+    }
+    si->raw_mcontext->pc = next;
+    instr_free(drcontext, &insn);
+    atomic_fetch_add_explicit(&g_fastpath_faults, 1, memory_order_relaxed);
+    return DR_SIGNAL_SUPPRESS;
 }
 
 static void
@@ -2122,6 +2183,7 @@ event_exit(void)
 {
     dr_printf("rtmap: --- Producer Stats (ambient per-thread) ---\n");
     dr_printf("rtmap:   wr_fast: %llu\n", (unsigned long long)atomic_load(&g_stat_inline_writes));
+    dr_printf("rtmap:   fastpath_faults_recovered: %llu\n", (unsigned long long)atomic_load(&g_fastpath_faults));
     dr_printf("rtmap:   reads:   %llu\n", (unsigned long long)atomic_load(&g_stat_reads));
     dr_printf("rtmap:   calls:   %llu\n", (unsigned long long)atomic_load(&g_stat_calls));
     dr_printf("rtmap:   returns: %llu\n", (unsigned long long)atomic_load(&g_stat_returns));
@@ -2267,6 +2329,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     drmgr_register_filter_syscall_event(event_filter_syscall);
     drmgr_register_post_syscall_event(event_post_syscall);
     dr_register_fork_init_event(event_fork_init);
+    drmgr_register_signal_event(event_signal_fastpath_recover);
 
     drmgr_register_bb_instrumentation_event(event_bb_analysis,
                                             event_bb_insert, NULL);

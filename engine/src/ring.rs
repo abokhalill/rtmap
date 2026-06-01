@@ -653,3 +653,38 @@ impl RingOrchestrator {
         total
     }
 }
+
+/// Used to discover forked children whose in-band PROCESS_FORK event
+/// is trapped inside their own (not yet attached) ring. 
+/// Returns None if the ctl is absent or invalid.
+pub fn peek_ctl_identity(pid: u32) -> Option<(u32, u32)> {
+    let name = format!("/rtmap_ctl_{}\0", pid);
+    let shm = MappedShm::open(name.as_bytes())?;
+    let hdr = unsafe { &*(shm.ptr as *const CtlHeader) };
+    if hdr.magic != RTMAP_CTL_MAGIC
+        || hdr.proto_version != RTMAP_PROTO_VERSION
+        || hdr.build_hash != rtmap_abi_hash()
+    {
+        return None;
+    }
+    Some((hdr.target_pid, hdr.parent_pid))
+}
+
+/// Enumerate POSIX shm objects (/dev/shm) and return every pid that has a
+/// live `rtmap_ctl_<pid>` segment. Cheap directory scan; validation is
+/// deferred to `peek_ctl_identity`.
+pub fn enumerate_ctl_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/dev/shm") {
+        for ent in rd.flatten() {
+            if let Ok(name) = ent.file_name().into_string() {
+                if let Some(rest) = name.strip_prefix("rtmap_ctl_") {
+                    if let Ok(pid) = rest.parse::<u32>() {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+    }
+    pids
+}

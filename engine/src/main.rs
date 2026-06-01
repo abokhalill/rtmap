@@ -106,14 +106,74 @@ impl ChildProcessTracker {
     }
 
     fn register_fork(&mut self, child_pid: u32) {
-        if !self.pending_pids.contains(&child_pid) {
-            self.pending_pids.push(child_pid);
-            self.pending_since.push(std::time::Instant::now());
-            self.shared_regions_stale = true;
+        if self.pending_pids.contains(&child_pid) {
+            return;
+        }
+        // skip pids we've already attached as a child orchestrator
+        if self
+            .child_orchs
+            .iter()
+            .any(|co| co.target_pid() == Some(child_pid))
+        {
+            return;
+        }
+        if Some(child_pid) == self.root_pid {
+            return;
+        }
+        self.pending_pids.push(child_pid);
+        self.pending_since.push(std::time::Instant::now());
+        self.shared_regions_stale = true;
+    }
+
+    /// True if `pid` is the root or an already attached child; i.e. part of
+    /// our instrumented process tree.
+    fn is_known_pid(&self, pid: u32) -> bool {
+        if Some(pid) == self.root_pid {
+            return true;
+        }
+        self.child_orchs
+            .iter()
+            .any(|co| co.target_pid() == Some(pid))
+    }
+
+    /// each forked tracer independently creates `/rtmap_ctl_<pid>` in `map_ctl_ring()` *before*
+    /// running instrumented code, so we scan `/dev/shm` and attach any ctl
+    /// whose parent_pid chains back into our tree.
+    fn scan_shm_for_children(&mut self) {
+        if self.root_pid.is_none() {
+            return;
+        }
+        for pid in rtmap::ring::enumerate_ctl_pids() {
+            if self.is_known_pid(pid) || self.pending_pids.contains(&pid) {
+                continue;
+            }
+            // don't re-adopt a dead pid whose ctl shm lingered after exit;
+            // /proc liveness is the source of truth.
+            if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                continue;
+            }
+            match rtmap::ring::peek_ctl_identity(pid) {
+                Some((target, parent)) if target == pid => {
+                    // only adopt processes whose parent is in our tree;
+                    // grandchildren attach on a later tick once their parent
+                    // becomes known.
+                    if self.is_known_pid(parent) {
+                        eprintln!(
+                            "rtmap: discovered child pid={} via shm scan (parent={})",
+                            pid, parent
+                        );
+                        self.register_fork(pid);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
     fn discover(&mut self) {
+        // adopt forked children whose PROCESS_FORK is
+        // trapped inside their own ring (see scan_shm_for_children).
+        self.scan_shm_for_children();
         let had_pending = !self.pending_pids.is_empty();
         let now = std::time::Instant::now();
         let ttl = std::time::Duration::from_secs(PENDING_PID_TTL_SECS);

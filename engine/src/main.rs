@@ -915,9 +915,6 @@ fn run_headless(
         while tick_events < HEADLESS_BUDGET {
             batch_buf.clear();
             let got = orch.batch_drain(4096, &mut batch_buf);
-            if got == 0 {
-                break;
-            }
             tick_events += got;
             drained += got;
 
@@ -1130,6 +1127,12 @@ fn run_headless(
                     }
                     j += 1;
                 }
+            }
+
+            // break only when BOTH root and children are drained empty;
+            // forking server roots stay idle so we must not gate on `got`.
+            if got == 0 && child_got == 0 {
+                break;
             }
         }
 

@@ -115,6 +115,9 @@ impl Event {
 
 pub const MV_STATUS_ACTIVE: u32 = 0;
 pub const MV_STATUS_TERMINAL: u32 = 1;
+// RTMAP_BP_TIER_* parity (rtmap_bridge.h)
+pub const BP_TIER_SHED_READS: u32 = 1;
+pub const BP_TIER_SHED_WRITES: u32 = 2;
 pub const COMPOUND_MAX_SLOTS: usize = 8;
 pub const EVENT_PROCESS_FORK: u8 = 13;
 
@@ -593,8 +596,9 @@ impl RingOrchestrator {
         hdr.priority_bloom[b2 / 64] |= 1u64 << (b2 % 64);
     }
 
-    /// tiered backpressure: bp=0 normal, bp=1 shed reads, bp=2 shed non-bloom writes.
-    /// thresholds: 6/8 -> shed reads, 7/8 -> shed writes, <3/8 -> clear.
+    /// tiered backpressure; tier values must match RTMAP_BP_TIER_* in
+    /// rtmap_bridge.h. thresholds: 6/8 -> shed reads+bb, 7/8 -> shed inline
+    /// writes, <3/8 -> clear.
     pub fn update_backpressure(&self) {
         const BP_SHED_READS: u64 = 6;
         const BP_SHED_WRITES: u64 = 7;
@@ -606,9 +610,9 @@ impl RingOrchestrator {
             let fill_eighths = (h.saturating_sub(t) << 3) / hdr.capacity as u64;
             let bp = hdr.backpressure.load(Ordering::Relaxed);
             let new_bp = if fill_eighths >= BP_SHED_WRITES {
-                2
+                BP_TIER_SHED_WRITES
             } else if fill_eighths >= BP_SHED_READS {
-                1
+                BP_TIER_SHED_READS
             } else if fill_eighths < BP_LOW {
                 0
             } else {

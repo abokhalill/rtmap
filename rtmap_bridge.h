@@ -67,8 +67,14 @@
 #define RTMAP_REG_COUNT 18
 
 #define RTMAP_BP_LOW_WATER   3
-#define RTMAP_BP_SHED_READS  6  /* 6/8: shed reads + bb_entry */
-#define RTMAP_BP_SHED_WRITES 7  /* 7/8: shed non-bloom writes */
+#define RTMAP_BP_SHED_READS  6
+#define RTMAP_BP_SHED_WRITES 7
+
+/* ring->backpressure tier values; engine writes, tracer gates on them.
+ * must match engine ring.rs update_backpressure(). */
+#define RTMAP_BP_TIER_NONE        0
+#define RTMAP_BP_TIER_SHED_READS  1  /* shed reads (bloom survives) + inline bb_entry */
+#define RTMAP_BP_TIER_SHED_WRITES 2  /* + shed all inline writes (counted, never silent) */
 
 #define RTMAP_BLOOM_U64S    512   /* 4KB = 32768 bits */
 #define RTMAP_BLOOM_BITS    (RTMAP_BLOOM_U64S * 64)
@@ -94,7 +100,8 @@ typedef struct __attribute__((aligned(RTMAP_CACHE_LINE))) {
     uint32_t nesting_level;
     uint64_t stat_reentrant_drops;
     uint64_t stat_truncated_writes;
-    uint64_t _cl0_reserved[2];
+    uint64_t stat_shed_writes;  /* inline writes shed at bp>=2 */
+    uint64_t stat_shed_bb;      /* inline bb_entry shed at bp>=1 */
     /* cl1: stats */
     uint64_t stat_inline_writes;
     uint64_t stat_reads;

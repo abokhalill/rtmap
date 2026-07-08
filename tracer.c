@@ -21,6 +21,8 @@
 #define OFF_PAD_NESTING        ((int)offsetof(rtmap_scratch_pad_t, nesting_level))
 #define OFF_PAD_REENTRANT      ((int)offsetof(rtmap_scratch_pad_t, stat_reentrant_drops))
 #define OFF_PAD_TRUNCATED      ((int)offsetof(rtmap_scratch_pad_t, stat_truncated_writes))
+#define OFF_PAD_SHED_WRITES    ((int)offsetof(rtmap_scratch_pad_t, stat_shed_writes))
+#define OFF_PAD_SHED_BB        ((int)offsetof(rtmap_scratch_pad_t, stat_shed_bb))
 
 _Static_assert(offsetof(rtmap_scratch_pad_t, scratch[0]) ==  0, "pad.scratch[0] drift");
 _Static_assert(offsetof(rtmap_scratch_pad_t, ring_data)  == 16, "pad.ring_data drift");
@@ -28,6 +30,8 @@ _Static_assert(offsetof(rtmap_scratch_pad_t, ring_mask)  == 24, "pad.ring_mask d
 _Static_assert(offsetof(rtmap_scratch_pad_t, nesting_level) == 28, "pad.nesting drift");
 _Static_assert(offsetof(rtmap_scratch_pad_t, stat_reentrant_drops) == 32, "pad.reentrant drift");
 _Static_assert(offsetof(rtmap_scratch_pad_t, stat_truncated_writes) == 40, "pad.truncated drift");
+_Static_assert(offsetof(rtmap_scratch_pad_t, stat_shed_writes) == 48, "pad.shed_writes drift");
+_Static_assert(offsetof(rtmap_scratch_pad_t, stat_shed_bb) == 56, "pad.shed_bb drift");
 _Static_assert(offsetof(rtmap_scratch_pad_t, stat_inline_writes) == 64, "pad.stat_inline drift");
 _Static_assert(sizeof(rtmap_scratch_pad_t) == 128, "pad size drift");
 
@@ -104,6 +108,8 @@ static _Atomic uint64_t g_stat_priority_reads = 0;
 static _Atomic uint64_t g_stat_shed_reads     = 0;
 static _Atomic uint64_t g_stat_reentrant_drops = 0;
 static _Atomic uint64_t g_stat_truncated_writes = 0;
+static _Atomic uint64_t g_stat_shed_writes = 0;
+static _Atomic uint64_t g_stat_shed_bbs = 0;
 
 /* JIT-time site counters */
 static _Atomic uint64_t g_jit_gpr_sites      = 0;
@@ -250,6 +256,7 @@ emit_bb_entry(void *drcontext, instrlist_t *bb, instr_t *where, app_pc bb_pc)
 
     instr_t *skip_label = INSTR_CREATE_label(drcontext);
     instr_t *no_flush   = INSTR_CREATE_label(drcontext);
+    instr_t *bp_ok      = INSTR_CREATE_label(drcontext);
 
     drreg_reserve_aflags(drcontext, bb, where);
 
@@ -274,7 +281,8 @@ emit_bb_entry(void *drcontext, instrlist_t *bb, instr_t *where, app_pc bb_pc)
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jcc(drcontext, OP_jz, opnd_create_instr(skip_label)));
 
-    /* backpressure check */
+    /* shed at bp>=1; shed path counts into pad, normal path pays only
+     * the inverted (taken) branch */
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
@@ -284,7 +292,19 @@ emit_bb_entry(void *drcontext, instrlist_t *bb, instr_t *where, app_pc bb_pc)
         INSTR_CREATE_test(drcontext,
             opnd_create_reg(scratch), opnd_create_reg(scratch)));
     instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_jcc(drcontext, OP_jnz, opnd_create_instr(skip_label)));
+        INSTR_CREATE_jcc(drcontext, OP_jz, opnd_create_instr(bp_ok)));
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(RTMAP_RAW_SLOT_SCRATCH))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_add(drcontext,
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_SHED_BB),
+            OPND_CREATE_INT32(1)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jmp(drcontext, opnd_create_instr(skip_label)));
+    instrlist_meta_preinsert(bb, where, bp_ok);
 
     /* scratch = pad ptr */
     instrlist_meta_preinsert(bb, where,
@@ -458,6 +478,7 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
 
     instr_t *skip_label     = INSTR_CREATE_label(drcontext);
     instr_t *reentrant_skip = INSTR_CREATE_label(drcontext);
+    instr_t *bp_ok          = INSTR_CREATE_label(drcontext);
 
     drreg_reserve_aflags(drcontext, bb, where);
 
@@ -501,16 +522,25 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jcc(drcontext, OP_jz, opnd_create_instr(skip_label)));
 
+    /* shed at bp>=2 only (reads/bb shed first at bp>=1); scratch = pad ptr */
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(reg_addr),
             dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
                 RAW_TLS(RTMAP_RAW_SLOT_BP))));
     instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_test(drcontext,
-            opnd_create_reg(reg_addr), opnd_create_reg(reg_addr)));
+        INSTR_CREATE_cmp(drcontext,
+            opnd_create_reg(reg_addr),
+            OPND_CREATE_INT32(RTMAP_BP_TIER_SHED_WRITES)));
     instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_jcc(drcontext, OP_jnz, opnd_create_instr(skip_label)));
+        INSTR_CREATE_jcc(drcontext, OP_jl, opnd_create_instr(bp_ok)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_add(drcontext,
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_SHED_WRITES),
+            OPND_CREATE_INT32(1)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jmp(drcontext, opnd_create_instr(skip_label)));
+    instrlist_meta_preinsert(bb, where, bp_ok);
 
     /* slot = ring_data + (head & mask) * 32 */
     instrlist_meta_preinsert(bb, where,
@@ -981,6 +1011,15 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
         DR_ASSERT(false);
 }
 
+/* only writer of RAW_SLOT_BP: inline gates read a tier that is at most
+ * one BB stale (this runs at every BB end, push helper, and pre-syscall) */
+static inline void
+mirror_backpressure(void *drcontext, rtmap_ring_header_t *ring)
+{
+    uint32_t bp = atomic_load_explicit(&ring->backpressure, memory_order_relaxed);
+    raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_BP), (void *)(uintptr_t)bp);
+}
+
 static void
 flush_head_cache(void *drcontext)
 {
@@ -990,6 +1029,7 @@ flush_head_cache(void *drcontext)
     uint64_t cached_head = (uint64_t)(uintptr_t)raw_tls_get(
         drcontext, RAW_TLS(RTMAP_RAW_SLOT_HEAD));
     atomic_store_explicit(&ring->head, cached_head, memory_order_release);
+    mirror_backpressure(drcontext, ring);
 }
 
 static void
@@ -1000,6 +1040,7 @@ sync_head_cache(void *drcontext)
     if (!ring) return;
     uint64_t real_head = atomic_load_explicit(&ring->head, memory_order_relaxed);
     raw_tls_set(drcontext, RAW_TLS(RTMAP_RAW_SLOT_HEAD), (void *)(uintptr_t)real_head);
+    mirror_backpressure(drcontext, ring);
 }
 
 static rtmap_ring_header_t *
@@ -2175,6 +2216,8 @@ event_thread_exit(void *drcontext)
         atomic_fetch_add_explicit(&g_stat_dropped,       pad->stat_dropped,        memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_reentrant_drops, pad->stat_reentrant_drops, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_truncated_writes, pad->stat_truncated_writes, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_stat_shed_writes, pad->stat_shed_writes, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_stat_shed_bbs, pad->stat_shed_bb, memory_order_relaxed);
         dr_thread_free(drcontext, pad, sizeof(rtmap_scratch_pad_t));
     }
 
@@ -2208,6 +2251,8 @@ event_exit(void)
     dr_printf("rtmap:   rd_shed: %llu\n", (unsigned long long)atomic_load(&g_stat_shed_reads));
     dr_printf("rtmap:   reentry: %llu\n", (unsigned long long)atomic_load(&g_stat_reentrant_drops));
     dr_printf("rtmap:   wr_trunc:%llu\n", (unsigned long long)atomic_load(&g_stat_truncated_writes));
+    dr_printf("rtmap:   wr_shed: %llu\n", (unsigned long long)atomic_load(&g_stat_shed_writes));
+    dr_printf("rtmap:   bb_shed: %llu\n", (unsigned long long)atomic_load(&g_stat_shed_bbs));
     dr_printf("rtmap: --- JIT site breakdown ---\n");
     dr_printf("rtmap:   imm_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_imm_sites));
     dr_printf("rtmap:   gpr_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_gpr_sites));

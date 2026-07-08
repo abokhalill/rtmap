@@ -1148,6 +1148,9 @@ flush_read_buf(void)
         drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
         return;
     }
+    /* publish cached head first: rtmap_push_* reads ring->head; a stale
+     * published head clobbers up to 63 unpublished inline slots */
+    flush_head_cache(drcontext);
     uint16_t tid = tls_thread_id(drcontext);
     rtmap_scratch_pad_t *pad = tls_pad(drcontext);
     uint32_t n = buf->count;
@@ -1179,6 +1182,7 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
 
     rtmap_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
+    flush_head_cache(drcontext);
     maybe_emit_module_load(drcontext, ring);
     uint16_t tid = tls_thread_id(drcontext);
     uint32_t seq = tls_next_seq(drcontext);
@@ -1231,6 +1235,7 @@ at_reload(uint64_t src_addr, uint32_t size, uint32_t dest_reg_idx)
 
     rtmap_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
+    flush_head_cache(drcontext);
     uint16_t tid = tls_thread_id(drcontext);
     uint32_t seq = tls_next_seq(drcontext);
     uint64_t val = safe_read_value(src_addr, size);
@@ -1288,6 +1293,7 @@ at_return(uint64_t retaddr)
 
     rtmap_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
+    flush_head_cache(drcontext);
     uint16_t tid = tls_thread_id(drcontext);
     uint32_t seq = tls_next_seq(drcontext);
     rtmap_push_ex(ring, retaddr, 0, 0, RTMAP_EVENT_RETURN, tid, seq);
@@ -1308,6 +1314,7 @@ at_tail_call(uint64_t target_pc, uint64_t frame_base)
 
     rtmap_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
+    flush_head_cache(drcontext);
     uint16_t tid = tls_thread_id(drcontext);
     uint32_t seq = tls_next_seq(drcontext);
     rtmap_push_ex(ring, target_pc, 0, frame_base, RTMAP_EVENT_TAIL_CALL, tid, seq);
@@ -1387,8 +1394,6 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     handle_pending_post_write(drcontext, bb, instr, data);
 
     if (instr_is_call_direct(instr)) {
-        dr_insert_clean_call(drcontext, bb, instr,
-                             (void *)flush_head_cache, false, 0);
         app_pc target = instr_get_branch_target_pc(instr);
         dr_insert_clean_call(drcontext, bb, instr,
                              (void *)at_call, false, 2,
@@ -1397,8 +1402,6 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     }
 
     if (instr_is_return(instr)) {
-        dr_insert_clean_call(drcontext, bb, instr,
-                             (void *)flush_head_cache, false, 0);
         dr_insert_clean_call(drcontext, bb, instr,
                              (void *)at_return, false, 1,
                              OPND_CREATE_INT64((uint64_t)(ptr_uint_t)
@@ -1415,8 +1418,6 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                 ? (ptr_uint_t)target - (ptr_uint_t)here
                 : (ptr_uint_t)here - (ptr_uint_t)target;
             if (dist > 4096) {
-                dr_insert_clean_call(drcontext, bb, instr,
-                                     (void *)flush_head_cache, false, 0);
                 dr_insert_clean_call(drcontext, bb, instr,
                                      (void *)at_tail_call, false, 2,
                                      OPND_CREATE_INT64((uint64_t)(ptr_uint_t)target),
@@ -1662,6 +1663,7 @@ wrap_malloc_post(void *wrapctx, void *user_data)
     void *drcontext = drwrap_get_drcontext(wrapctx);
     rtmap_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) return;
+    flush_head_cache(drcontext);
     uint16_t tid = tls_thread_id(drcontext);
     uint32_t seq = tls_next_seq(drcontext);
     rtmap_push_alloc(ring, ptr, (uint32_t)size, size,
@@ -1689,6 +1691,7 @@ wrap_realloc_pre(void *wrapctx, void **user_data)
     if (old_ptr != NULL) {
         rtmap_ring_header_t *ring = tls_ring(drcontext);
         if (ring) {
+            flush_head_cache(drcontext);
             uint16_t tid = tls_thread_id(drcontext);
             uint32_t seq = tls_next_seq(drcontext);
             rtmap_push_ex(ring, (uint64_t)(uintptr_t)old_ptr, 0, 0,
@@ -1714,6 +1717,7 @@ wrap_realloc_post(void *wrapctx, void *user_data)
     void *drcontext = drwrap_get_drcontext(wrapctx);
     rtmap_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) return;
+    flush_head_cache(drcontext);
     uint16_t tid = tls_thread_id(drcontext);
     uint32_t seq = tls_next_seq(drcontext);
     rtmap_push_alloc(ring, ptr, (uint32_t)size, size,
@@ -1731,6 +1735,7 @@ wrap_free_pre(void *wrapctx, void **user_data)
     void *drcontext = drwrap_get_drcontext(wrapctx);
     rtmap_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) return;
+    flush_head_cache(drcontext);
     uint16_t tid = tls_thread_id(drcontext);
     uint32_t seq = tls_next_seq(drcontext);
     rtmap_push_ex(ring, (uint64_t)(uintptr_t)ptr, 0, 0,

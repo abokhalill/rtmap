@@ -1246,6 +1246,12 @@ fn run_headless(
                         lapped
                     );
                 }
+                if world.unknown_event_kinds > 0 {
+                    eprintln!(
+                        "rtmap: WARNING: {} events with unknown kind — tracer/engine kind table drift",
+                        world.unknown_event_kinds
+                    );
+                }
                 eprintln!(
                     "rtmap: {} events processed, rendering snapshot\n\
                      rtmap: STM projections={} indirect_reg={} indirect_stamps={} schisms={} pool_reuse={} deferred_replays={} deferred_pending={}",
@@ -1861,8 +1867,12 @@ fn headless_render(
             6 => "CMIS",
             7 => "MLOAD",
             8 => "TCALL",
+            9 => "ALLOC",
+            10 => "FREE",
             11 => "BB",
             12 => "RLOAD",
+            13 => "FORK",
+            14 => "SMAP",
             _ => "?",
         };
         let _ = writeln!(

@@ -1393,6 +1393,9 @@ pub struct WorldState {
     // false positives from cross-thread ALLOC/WRITE ring reordering.
     pub last_alloc_event_count: u64,
     pub total_event_count: u64,
+    /// kind-table drift detector; nonzero means tracer emits kinds the
+    /// reconciler does not decode
+    pub unknown_event_kinds: u64,
 }
 
 impl WorldState {
@@ -1411,6 +1414,7 @@ impl WorldState {
             proc_mem: None,
             last_alloc_event_count: 0,
             total_event_count: 0,
+            unknown_event_kinds: 0,
         }
     }
 

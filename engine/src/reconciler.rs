@@ -24,6 +24,7 @@ pub const EVENT_RETURN: u8 = 3;
 pub const EVENT_REG_SNAPSHOT: u8 = 5;
 pub const EVENT_CACHE_MISS: u8 = 6;
 pub const EVENT_MODULE_LOAD: u8 = 7;
+pub const EVENT_TAIL_CALL: u8 = 8;
 pub const EVENT_ALLOC: u8 = 9;
 pub const EVENT_FREE: u8 = 10;
 pub const EVENT_BB_ENTRY: u8 = 11;
@@ -500,6 +501,13 @@ pub fn process_event(
             }
             true
         }
+        EVENT_TAIL_CALL => {
+            // frame replacement, not a push: no RETURN will pair with this,
+            // so pushing a shadow frame here would skew the stack. rsp bound
+            // is the only safely extractable fact.
+            heap_oracle.update_stack(ev.thread_id, ev.value);
+            true
+        }
         EVENT_REG_SNAPSHOT => {
             // handled by apply_reg_snapshot() on the drained batch; see note there.
             let _ = (orch, ring_idx);
@@ -732,7 +740,16 @@ pub fn process_event(
             // via world.shared_map_events; we just log here.
             true
         }
-        _ => false,
+        other => {
+            world.unknown_event_kinds += 1;
+            if world.unknown_event_kinds <= 8 {
+                eprintln!(
+                    "rtmap: UNKNOWN_EVENT_KIND {} tid={} addr=0x{:x} (#{}) — tracer/engine kind table drift?",
+                    other, ev.thread_id, ev.addr, world.unknown_event_kinds
+                );
+            }
+            false
+        }
     }
 }
 
@@ -1648,6 +1665,10 @@ mod tests {
             EVENT_MODULE_LOAD, 7,
             "EVENT_MODULE_LOAD != RTMAP_EVENT_MODULE_LOAD"
         );
+        assert_eq!(
+            EVENT_TAIL_CALL, 8,
+            "EVENT_TAIL_CALL != RTMAP_EVENT_TAIL_CALL"
+        );
         assert_eq!(EVENT_ALLOC, 9, "EVENT_ALLOC != RTMAP_EVENT_ALLOC");
         assert_eq!(EVENT_FREE, 10, "EVENT_FREE != RTMAP_EVENT_FREE");
         assert_eq!(
@@ -1658,6 +1679,10 @@ mod tests {
         assert_eq!(
             EVENT_PROCESS_FORK, 13,
             "EVENT_PROCESS_FORK != RTMAP_EVENT_PROCESS_FORK"
+        );
+        assert_eq!(
+            EVENT_SHARED_MAP, 14,
+            "EVENT_SHARED_MAP != RTMAP_EVENT_SHARED_MAP"
         );
     }
 

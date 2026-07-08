@@ -115,7 +115,7 @@ impl Event {
 
 pub const MV_STATUS_ACTIVE: u32 = 0;
 pub const MV_STATUS_TERMINAL: u32 = 1;
-// RTMAP_BP_TIER_* parity (rtmap_bridge.h)
+// RTMAP_BP_TIER_* parity 
 pub const BP_TIER_SHED_READS: u32 = 1;
 pub const BP_TIER_SHED_WRITES: u32 = 2;
 pub const COMPOUND_MAX_SLOTS: usize = 8;
@@ -250,10 +250,24 @@ pub struct ThreadRing {
     shm: MappedShm,
     pub thread_id: u16,
     pub alive: bool,
+    /// events destroyed by producer lap (inline paths have no full check)
+    pub lapped_events: u64,
+    lap_episodes: u64,
 }
 
 impl ThreadRing {
     fn from_shm(shm: MappedShm, thread_id: u16) -> Option<Self> {
+        // header fields drive pointer arithmetic; reject corrupt/truncated
+        // shm here, not as a segfault in the drain loop
+        if shm.len < mem::size_of::<RingHeader>() {
+            eprintln!(
+                "rtmap: ring tid={} REJECTED: shm {} B < header {} B",
+                thread_id,
+                shm.len,
+                mem::size_of::<RingHeader>()
+            );
+            return None;
+        }
         let hdr = unsafe { &*(shm.ptr as *const RingHeader) };
         if hdr.magic != RTMAP_MAGIC {
             return None;
@@ -265,11 +279,48 @@ impl ThreadRing {
             );
             return None;
         }
+        if hdr.capacity == 0 || !hdr.capacity.is_power_of_two() {
+            eprintln!(
+                "rtmap: ring tid={} REJECTED: capacity {} not a power of two",
+                thread_id, hdr.capacity
+            );
+            return None;
+        }
+        if hdr.entry_size as usize != mem::size_of::<Event>() {
+            eprintln!(
+                "rtmap: ring tid={} REJECTED: entry_size {} != {}",
+                thread_id,
+                hdr.entry_size,
+                mem::size_of::<Event>()
+            );
+            return None;
+        }
+        let need = mem::size_of::<RingHeader>() + hdr.capacity as usize * mem::size_of::<Event>();
+        if shm.len < need {
+            eprintln!(
+                "rtmap: ring tid={} REJECTED: shm {} B < required {} B (capacity {})",
+                thread_id, shm.len, need, hdr.capacity
+            );
+            return None;
+        }
         Some(Self {
             shm,
             thread_id,
             alive: true,
+            lapped_events: 0,
+            lap_episodes: 0,
         })
+    }
+
+    fn record_lap(&mut self, lost: u64) {
+        self.lapped_events += lost;
+        self.lap_episodes += 1;
+        if self.lap_episodes <= 4 || self.lap_episodes.is_power_of_two() {
+            eprintln!(
+                "rtmap: RING_LAP #{} tid={} — producer overwrote ~{} unconsumed events (total {})",
+                self.lap_episodes, self.thread_id, lost, self.lapped_events
+            );
+        }
     }
 
     pub fn header(&self) -> &RingHeader {
@@ -281,34 +332,25 @@ impl ThreadRing {
     }
 
     #[inline]
-    pub fn pop_n(&self, n: u64, out: &mut [Event]) -> bool {
-        debug_assert!(out.len() >= n as usize, "pop_n: out slice too small");
-        let hdr = self.header();
-        let mask = (hdr.capacity - 1) as u64;
-        let data = unsafe { hdr.data() };
-        let t = hdr.tail.load(Ordering::Relaxed);
-        let h = hdr.head.load(Ordering::Acquire);
-        if h.saturating_sub(t) < n {
-            return false;
-        }
-        for i in 0..n {
-            out[i as usize] = unsafe { ptr::read_volatile(data.add(((t + i) & mask) as usize)) };
-        }
-        hdr.tail.store(t + n, Ordering::Release);
-        true
-    }
-
-    #[inline]
-    pub fn consume_batch(&self, out: &mut [Event]) -> usize {
+    pub fn consume_batch(&mut self, out: &mut [Event]) -> usize {
         // atomic compound runs: REG_SNAPSHOT (7 slots) and COMPOUND writes
         // (variable slots) must never be split across batch boundaries.
         const EVENT_REG_SNAPSHOT: u8 = 5;
-        let hdr = self.header();
-        let mask = (hdr.capacity - 1) as u64;
+        // unbounded lifetime via raw deref: record_lap needs &mut self below
+        let hdr: &RingHeader = unsafe { &*(self.shm.ptr as *const RingHeader) };
+        let ring_cap = hdr.capacity as u64;
+        let mask = ring_cap - 1;
         let data = unsafe { hdr.data() };
-        let t = hdr.tail.load(Ordering::Relaxed);
+        let mut t = hdr.tail.load(Ordering::Relaxed);
         let h = hdr.head.load(Ordering::Acquire);
-        let avail = h.saturating_sub(t).min(hdr.capacity as u64) as usize;
+        // producer lap: inline paths have no full check; slots in
+        // [t, h-cap) are already overwritten. skip loudly, resync.
+        if h.saturating_sub(t) > ring_cap {
+            let resync = h - ring_cap;
+            self.record_lap(resync - t);
+            t = resync;
+        }
+        let avail = h.saturating_sub(t) as usize;
         let cap = avail.min(out.len());
         if cap == 0 {
             return 0;
@@ -341,6 +383,15 @@ impl ThreadRing {
             }
             out[n] = ev;
             n += 1;
+        }
+        // torn-read check: producer lapped into [t, t+n) during the copy —
+        // copied slots may be torn/reordered. discard whole batch, resync.
+        let h2 = hdr.head.load(Ordering::Acquire);
+        if h2.saturating_sub(t) > ring_cap {
+            let resync = h2 - ring_cap;
+            self.record_lap(resync - t);
+            hdr.tail.store(resync, Ordering::Release);
+            return 0;
         }
         hdr.tail.store(t + n as u64, Ordering::Release);
         n
@@ -582,6 +633,9 @@ impl RingOrchestrator {
     }
     pub fn active_count(&self) -> usize {
         self.rings.iter().filter(|r| r.alive).count()
+    }
+    pub fn total_lapped(&self) -> u64 {
+        self.rings.iter().map(|r| r.lapped_events).sum()
     }
 
     pub fn bloom_insert(&self, addr: u64) {

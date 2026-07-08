@@ -313,6 +313,10 @@ impl ChildProcessTracker {
         }
     }
 
+    fn total_lapped(&self) -> u64 {
+        self.child_orchs.iter().map(|co| co.total_lapped()).sum()
+    }
+
     fn child_count(&self) -> usize {
         self.child_orchs.len()
     }
@@ -852,6 +856,16 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
         }
     }
     tui::restore_terminal(&mut terminal);
+    let lapped = orch.total_lapped() + child_tracker.total_lapped();
+    if lapped > 0 {
+        eprintln!(
+            "rtmap: WARNING: {} events destroyed by ring lap (producer outran consumer)",
+            lapped
+        );
+    }
+    if seq_gaps > 0 {
+        eprintln!("rtmap: WARNING: {} sequence gaps detected", seq_gaps);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1202,6 +1216,13 @@ fn run_headless(
                     eprintln!(
                         "rtmap: WARNING: {} sequence gaps detected — ring overflow or event loss occurred",
                         seq_gaps
+                    );
+                }
+                let lapped = orch.total_lapped() + child_tracker.total_lapped();
+                if lapped > 0 {
+                    eprintln!(
+                        "rtmap: WARNING: {} events destroyed by ring lap (producer outran consumer)",
+                        lapped
                     );
                 }
                 eprintln!(

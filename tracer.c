@@ -764,8 +764,13 @@ compound_fill_continuations(uint32_t write_size)
     uint32_t kf_cont = rtmap_v3_make_kf(RTMAP_EVENT_WRITE,
                                           RTMAP_FLAG_CONTINUATION, 0);
 
+    /* header ptr came from (cached_head & mask); continuations must re-mask
+     * or a header within 7 slots of the ring end writes past the mmap. */
+    rtmap_event_v3_t *data = (rtmap_event_v3_t *)(uintptr_t)pad->ring_data;
+    uint64_t header_idx = (uint64_t)(header - data);
+
     for (uint32_t k = 0; k < cont_count; k++) {
-        rtmap_event_v3_t *slot = header + 1 + k;
+        rtmap_event_v3_t *slot = &data[(header_idx + 1 + k) & pad->ring_mask];
         uint64_t chunk_ea = ea + (uint64_t)(k + 1) * 8;
         uint32_t chunk_sz = write_size - (k + 1) * 8;
         if (chunk_sz > 8) chunk_sz = 8;
@@ -784,10 +789,7 @@ compound_fill_continuations(uint32_t write_size)
         slot->rip_lo     = 0;
     }
 
-    /* advance head by cont_count additional slots */
-    uint64_t *head_cache = (uint64_t *)raw_tls_get(drcontext,
-                                RAW_TLS(RTMAP_RAW_SLOT_HEAD));
-    /* head_cache is the value, not a pointer; use raw TLS directly */
+    /* advance cached head by cont_count additional slots */
     void **base = (void **)dr_get_dr_segment_base(g_raw_tls_seg);
     uintptr_t cur = (uintptr_t)*(void **)((char *)base + RAW_TLS(RTMAP_RAW_SLOT_HEAD));
     *(void **)((char *)base + RAW_TLS(RTMAP_RAW_SLOT_HEAD)) = (void *)(cur + cont_count);

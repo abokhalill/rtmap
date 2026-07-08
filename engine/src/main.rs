@@ -27,6 +27,7 @@ struct RunConfig {
     no_bb: bool,
     tripwire_symbol: Option<String>,
     alloc_fns: Vec<(String, u32)>,
+    min_events: Option<u64>,
 }
 
 #[inline(always)]
@@ -347,6 +348,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
     let once = cfg.once;
     let server_mode = cfg.server_mode;
     let no_bb = cfg.no_bb;
+    let min_events = cfg.min_events.unwrap_or(1).max(1);
     let record_path = cfg.record_path;
     let topo_path = cfg.topo_path;
     let heatmap_path = cfg.heatmap_path;
@@ -421,6 +423,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
             &mut recorder,
             &mut topo,
             no_bb,
+            min_events,
         );
         eprintln!("rtmap: indirect registrations={} stamps={} map_size={}",
             world.stm.indirect_registrations, world.stm.indirect_stamps, world.stm.indirect_len());
@@ -908,6 +911,7 @@ fn run_headless(
     recorder: &mut Option<EventRecorder>,
     recorder_topo: &mut Option<TopologyStream>,
     no_bb: bool,
+    min_events: u64,
 ) {
     use std::io::Write;
     let stdout = io::stdout();
@@ -1187,7 +1191,7 @@ fn run_headless(
             let armed = if server_mode {
                 orch.tripwire_hit() || child_tracker.child_count() > 0
             } else {
-                *total > 0
+                *total >= min_events
             };
             // Don't auto-exit on idle while any child process is
             // still alive; rely on SIGINT or tracer death to terminate. This
@@ -2670,6 +2674,7 @@ fn parse_common_flags(args: &mut Vec<String>) -> RunConfig {
         no_bb,
         tripwire_symbol,
         alloc_fns,
+        min_events: take_flag_value(args, "--min-events").and_then(|v| v.parse().ok()),
     }
 }
 
@@ -2714,6 +2719,9 @@ fn cmd_run(args: &mut Vec<String>) {
             if cfg.coverage_path.is_none() {
                 cfg.coverage_path = prof.coverage.clone();
             }
+            if cfg.min_events.is_none() {
+                cfg.min_events = prof.min_events;
+            }
             if !prof.args.is_empty() {
                 prof.args.clone()
             } else {
@@ -2737,6 +2745,9 @@ fn cmd_run(args: &mut Vec<String>) {
             .and_then(|s| s.to_str())
             .unwrap_or("rtmap");
         cfg.heatmap_path = Some(format!("{}.heatmap.tsv", base));
+    }
+    if cfg.min_events.is_none() {
+        cfg.min_events = resolved_cfg.default_min_events;
     }
 
     launch(&target, &target_args, cfg, &resolved_cfg);

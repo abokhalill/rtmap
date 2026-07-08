@@ -20,30 +20,50 @@ fn fnv_feed(h: &mut u32, v: u32) {
     }
 }
 
-macro_rules! field_offset {
-    ($T:ty, $field:ident) => {{
-        let uninit = mem::MaybeUninit::<$T>::uninit();
-        let base = uninit.as_ptr() as usize;
-        let field = unsafe { &(*uninit.as_ptr()).$field as *const _ as usize };
-        (field - base) as u32
-    }};
+/// layout mirror of rtmap_scratch_pad_t. never instantiated; exists so the
+/// abi hash is computed from  offsets instead of literals;
+/// drift on either side fails the attach handshake instead of corrupting decode.
+#[repr(C, align(64))]
+#[allow(dead_code)]
+struct ScratchPadMirror {
+    scratch: [u64; 2],
+    ring_data: u64,
+    ring_mask: u32,
+    nesting_level: u32,
+    stat_reentrant_drops: u64,
+    stat_truncated_writes: u64,
+    stat_shed_writes: u64,
+    stat_shed_bb: u64,
+    stat_inline_writes: u64,
+    stat_reads: u64,
+    stat_reloads: u64,
+    stat_calls: u64,
+    stat_returns: u64,
+    stat_tail_calls: u64,
+    stat_dropped: u64,
+    ccc_audit_ctr: u64,
 }
+// parity with the _Static_asserts in tracer.c
+const _: () = assert!(mem::size_of::<ScratchPadMirror>() == 128);
+const _: () = assert!(mem::offset_of!(ScratchPadMirror, nesting_level) == 28);
+const _: () = assert!(mem::offset_of!(ScratchPadMirror, stat_reentrant_drops) == 32);
+const _: () = assert!(mem::offset_of!(ScratchPadMirror, stat_truncated_writes) == 40);
 
 pub fn rtmap_abi_hash() -> u32 {
     let mut h = 0x811c9dc5u32;
     fnv_feed(&mut h, mem::size_of::<Event>() as u32);
-    fnv_feed(&mut h, field_offset!(Event, addr));
-    fnv_feed(&mut h, field_offset!(Event, value));
-    fnv_feed(&mut h, field_offset!(Event, kind_flags));
-    fnv_feed(&mut h, field_offset!(Event, rip_lo));
+    fnv_feed(&mut h, mem::offset_of!(Event, addr) as u32);
+    fnv_feed(&mut h, mem::offset_of!(Event, value) as u32);
+    fnv_feed(&mut h, mem::offset_of!(Event, kind_flags) as u32);
+    fnv_feed(&mut h, mem::offset_of!(Event, rip_lo) as u32);
     fnv_feed(&mut h, mem::size_of::<RingHeader>() as u32);
-    fnv_feed(&mut h, field_offset!(RingHeader, head));
-    fnv_feed(&mut h, field_offset!(RingHeader, tail));
-    fnv_feed(&mut h, field_offset!(RingHeader, status));
-    fnv_feed(&mut h, 128); // sizeof(rtmap_scratch_pad_t)
-    fnv_feed(&mut h, 28);   // nesting_level
-    fnv_feed(&mut h, 32);   // stat_reentrant_drops
-    fnv_feed(&mut h, 40);   // stat_truncated_writes
+    fnv_feed(&mut h, mem::offset_of!(RingHeader, head) as u32);
+    fnv_feed(&mut h, mem::offset_of!(RingHeader, tail) as u32);
+    fnv_feed(&mut h, mem::offset_of!(RingHeader, status) as u32);
+    fnv_feed(&mut h, mem::size_of::<ScratchPadMirror>() as u32);
+    fnv_feed(&mut h, mem::offset_of!(ScratchPadMirror, nesting_level) as u32);
+    fnv_feed(&mut h, mem::offset_of!(ScratchPadMirror, stat_reentrant_drops) as u32);
+    fnv_feed(&mut h, mem::offset_of!(ScratchPadMirror, stat_truncated_writes) as u32);
     h
 }
 

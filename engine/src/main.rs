@@ -82,6 +82,22 @@ struct ChildProcessTracker {
     shared_interval_map: SharedIntervalMap,
     shared_regions_stale: bool,
     root_pid: Option<u32>,
+    tid_ns_warned: bool,
+}
+
+/// child procs restart tid at 0 (event_fork_init); bare tids alias parent
+/// shadow state (stacks/shadow_regs keyed by tid). pack proc idx into the
+/// high byte: 0x1NN = child 1, raw tid NN. 
+#[inline(always)]
+fn namespace_child_tid(raw: u16, child_idx: usize, warned: &mut bool) -> u16 {
+    if (raw > 0xFF || child_idx > 0xFE) && !*warned {
+        eprintln!(
+            "rtmap: WARNING: child tid namespace overflow (tid={} child={}) — shadow state may alias",
+            raw, child_idx
+        );
+        *warned = true;
+    }
+    ((child_idx as u16 + 1) << 8) | (raw & 0xFF)
 }
 
 const PENDING_PID_TTL_SECS: u64 = 30;
@@ -98,6 +114,7 @@ impl ChildProcessTracker {
             shared_interval_map: SharedIntervalMap::new(),
             shared_regions_stale: false,
             root_pid: None,
+            tid_ns_warned: false,
         }
     }
 
@@ -294,7 +311,11 @@ impl ChildProcessTracker {
             if total >= limit {
                 break;
             }
+            let start = buf.len();
             let got = co.batch_drain(limit - total, buf);
+            for (_, ev) in &mut buf[start..] {
+                ev.thread_id = namespace_child_tid(ev.thread_id, ci, &mut self.tid_ns_warned);
+            }
             if got == 0 {
                 if ci < self.child_empty_ticks.len() {
                     self.child_empty_ticks[ci] = self.child_empty_ticks[ci].saturating_add(1);

@@ -553,8 +553,8 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                                 seq_gaps += 1;
                                 if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
                                     eprintln!(
-                                        "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
-                                        seq_gaps, ev.thread_id, *exp, s32, gap_size
+                                        "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events) kind={} flags={:#x} addr={:#x} size={} val={:#x}",
+                                        seq_gaps, ev.thread_id, *exp, s32, gap_size, ev_kind, ev.flags(), ev.addr, ev.size, ev.value
                                     );
                                 }
                                 if let Some(ref mut ts) = topo {
@@ -582,8 +582,8 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                             seq_gaps += 1;
                             if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
                                 eprintln!(
-                                    "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
-                                    seq_gaps, ev.thread_id, *exp, s32, gap_size
+                                    "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events) kind={} flags={:#x} addr={:#x} size={} val={:#x}",
+                                    seq_gaps, ev.thread_id, *exp, s32, gap_size, ev_kind, ev.flags(), ev.addr, ev.size, ev.value
                                 );
                             }
                             if let Some(ref mut ts) = topo {
@@ -989,8 +989,8 @@ fn run_headless(
                             seq_gaps += 1;
                             if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
                                 eprintln!(
-                                    "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
-                                    seq_gaps, ev.thread_id, *exp, s32, gap_size
+                                    "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events) kind={} flags={:#x} addr={:#x} size={} val={:#x}",
+                                    seq_gaps, ev.thread_id, *exp, s32, gap_size, ev_kind, ev.flags(), ev.addr, ev.size, ev.value
                                 );
                             }
                             if let Some(ref mut ts) = recorder_topo {
@@ -1017,8 +1017,8 @@ fn run_headless(
                         seq_gaps += 1;
                         if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
                             eprintln!(
-                                "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
-                                seq_gaps, ev.thread_id, *exp, s32, gap_size
+                                "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events) kind={} flags={:#x} addr={:#x} size={} val={:#x}",
+                                seq_gaps, ev.thread_id, *exp, s32, gap_size, ev_kind, ev.flags(), ev.addr, ev.size, ev.value
                             );
                         }
                         if let Some(ref mut ts) = recorder_topo {

@@ -766,3 +766,17 @@ pub fn enumerate_ctl_pids() -> Vec<u32> {
     }
     pids
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_abi_hash_frozen() {
+        // must equal rtmap_build_hash_compute() in rtmap_bridge.h:
+        //   gcc -I. hash.c (calls it) -> 0x8d1fdff5
+        // mismatch = rust mirrors drifted from the header; fix the mirror,
+        // re-derive this literal from the C side only.
+        assert_eq!(rtmap_abi_hash(), 0x8d1fdff5);
+    }
+}

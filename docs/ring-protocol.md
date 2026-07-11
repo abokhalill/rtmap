@@ -13,8 +13,9 @@ The protocol is defined in `rtmap_bridge.h`. Protocol version: **3**.
 3. **Cache-line conscious.** The head and tail cursors occupy separate 64-byte
    cache lines to eliminate false sharing between the producer and consumer
    cores.
-4. **Bounded.** Each ring has a fixed power-of-two capacity. Full rings either
-   drop events or spin, depending on a per-ring flag.
+4. **Bounded.** Each ring has a fixed power-of-two capacity. On overflow,
+   clean-call pushes drop (counted); inline paths lap the consumer, which
+   detects and reports the loss (see Overflow policy).
 5. **Versioned.** Both ring headers and the control ring carry a
    `proto_version` field. The consumer validates this on attach and rejects
    mismatched versions.
@@ -78,39 +79,49 @@ for both formats.
 
 | Kind | Value | `addr` | `size` | `value` | Notes |
 |---|---|---|---|---|---|
-| `WRITE` | 0 | Memory address | Byte count | Post-write value | `rip_lo` set (v3) |
-| `READ` | 1 | Memory address | Byte count | 0 | Shed under backpressure |
+| `WRITE` | 0 | Memory address | Byte count | Post-write value | `rip_lo` set (v3); shed at BP tier 2 |
+| `READ` | 1 | Memory address | Byte count | Read value (≤8 B) | Shed at BP tier 1 (bloom survives) |
 | `CALL` | 2 | Callee PC | 0 | Frame base (RSP) | Triggers REG_SNAPSHOT |
 | `RETURN` | 3 | Return address | 0 | 0 | |
-| `OVERFLOW` | 4 | Instruction counter | 0 | 0 | Ring was full (diagnostic) |
+| `OVERFLOW` | 4 | Instruction counter | 0 | 0 | Defined; no producer emits it |
 | `REG_SNAPSHOT` | 5 | Instruction counter | 0 | 0 | 7 consecutive slots |
-| `CACHE_MISS` | 6 | Miss address | Cache level | Sample IP | |
+| `CACHE_MISS` | 6 | Miss address | Cache level | Sample IP | Defined; no producer (PEBS unwired) |
 | `MODULE_LOAD` | 7 | Runtime base addr | 0 | 0 | Emitted exactly once |
 | `TAIL_CALL` | 8 | Callee PC | 0 | Frame base (RSP) | JMP >4KB, main module |
-| `ALLOC` | 9 | Pointer returned | Alloc size (bytes) | (unused) | `drwrap` post-malloc/calloc/realloc |
+| `ALLOC` | 9 | Pointer returned | Size, low 32 bits | Full 64-bit size | `rip_lo` = caller retaddr low 32; `drwrap` post-malloc/calloc/realloc |
 | `FREE` | 10 | Pointer freed | 0 | 0 | `drwrap` pre-free / pre-realloc(old) |
-| `BB_ENTRY` | 11 | BB start PC | 0 | 0 | Fully inline, main module only. Shed under backpressure. |
-| `RELOAD` | 12 | Source address | Load size | Register index | MOV to callee-saved |
+| `BB_ENTRY` | 11 | BB start PC | 0 | 0 | Fully inline, main module only; shed at BP tier 1 |
+| `RELOAD` | 12 | Source address | Load size | Loaded value | Dest register index in flags byte; MOV to callee-saved |
 | `PROCESS_FORK` | 13 | Child PID | 0 | Parent PID | Emitted by child after `fork()` |
-| `SHARED_MAP` | 14 | Map address | Map length | Flags (MAP/UNMAP) | In-band `mmap`/`munmap` notification |
+| `SHARED_MAP` | 14 | Map address | fd, or 0xFFFFFFFF = unmap | Map length | In-band `mmap`/`munmap` notification |
 
 ### Backpressure levels
 
-The ring protocol defines three backpressure levels, communicated from engine
-to tracer via the `bp_level` field in the per-thread ring header:
+The ring protocol defines three backpressure tiers (`RTMAP_BP_TIER_*`),
+communicated from engine to tracer via the atomic `backpressure` field in the
+per-thread ring header. The tracer mirrors the tier into raw TLS
+(`RTMAP_RAW_SLOT_BP`) inside `flush_head_cache`/`sync_head_cache` — executed
+at every BB end, push helper, and pre-syscall — so the inline gates observe a
+tier at most one BB stale:
 
-| Level | Threshold | Behavior |
+| Tier | Threshold | Behavior |
 |---|---|---|
 | 0 (normal) | Ring < 6/8 full | All events emitted |
-| 1 (shed reads) | Ring ≥ 6/8 full | READ and BB_ENTRY events suppressed |
-| 2 (shed non-bloom) | Ring ≥ 7/8 full | All events suppressed EXCEPT: ALLOC, FREE, and writes whose `(addr + field_offset)` is present in the per-ring bloom filter |
+| 1 (shed reads) | Ring ≥ 6/8 full | Buffered READs suppressed (bloom-priority reads survive); inline BB_ENTRY suppressed |
+| 2 (shed writes) | Ring ≥ 7/8 full | Additionally, ALL inline main-module WRITEs suppressed. ALLOC/FREE/CALL/RETURN always land |
 
 Hysteresis: backpressure clears only when occupancy drops below 3/8.
 
-The bloom filter is populated by the engine when it stamps a heap allocation:
-for each field in the type projection, `bloom_insert(alloc_base + field_offset)`.
-This ensures that initialization writes to freshly-typed heap memory survive
-even the highest backpressure level.
+Shedding is never silent: suppressed inline writes and BB entries are counted
+per-thread (`stat_shed_writes`/`stat_shed_bb`) and reported at tracer exit as
+`wr_shed`/`bb_shed`; shed buffered reads count into `rd_shed`.
+
+The bloom filter is populated by the engine when it stamps a heap allocation
+(`bloom_insert(alloc_base + field_offset)` per field) and is consulted only on
+the READ path as a keep-filter. There is no inline bloom probe on the write
+path — two FNV hashes over 8 bytes (~70 ops) would dwarf the ~40-instruction
+inline write sequence — so tier 2 sheds writes unconditionally and relies on
+the counters for attribution.
 
 ### Compound wide writes
 
@@ -352,32 +363,32 @@ Fill >= 6/8 capacity:  consumer stores backpressure = 1  (release)
 Fill <  3/8 capacity:  consumer stores backpressure = 0  (release)
 ```
 
-The producer checks `backpressure` with a relaxed load. When backpressure is
-active, `rtmap_push_sampled()` silently drops `READ` and `BB_ENTRY` events
-(returns 1 instead of 0). `WRITE`, `CALL`, `RETURN`, `TAIL_CALL`, `ALLOC`,
-`FREE`, `RELOAD`, `MODULE_LOAD`, and `REG_SNAPSHOT` are **never** dropped by
-backpressure.
+The producer checks `backpressure` with a relaxed load on the clean-call
+paths, and reads the TLS mirror (`RTMAP_RAW_SLOT_BP`) on the inline paths.
+Tier 1 sheds buffered `READ`s (bloom-priority survive) and inline `BB_ENTRY`;
+tier 2 additionally sheds inline `WRITE`s. `CALL`, `RETURN`, `TAIL_CALL`,
+`ALLOC`, `FREE`, `RELOAD`, `MODULE_LOAD`, and `REG_SNAPSHOT` are **never**
+shed. All shedding is counted and reported at exit (see Backpressure levels).
 
-This mechanism degrades gracefully under load: read and BB_ENTRY events are
-low-priority observability data (reads carry no post-read values; BB_ENTRY
-affects only coverage counters, not topology). Shedding them reduces ring
-pressure without losing writes, lifecycle events, or control events.
+## Overflow policy
 
-## Spin-on-full
+Two distinct behaviors, by push path:
 
-If the ring's `flags` field has bit 0 set (`RTMAP_FLAG_SPIN_ON_FULL`), the
-producer spins instead of dropping events when the ring is full:
+- **Clean-call pushes** (`rtmap_push_ex*`): check `head - tail >= capacity`
+  and drop (return −1). Rings are always created `RTMAP_FLAG_DROP_ON_FULL`;
+  the `RTMAP_FLAG_SPIN_ON_FULL` pause-loop in the header is compiled but
+  unreachable with the current tracer.
+- **Inline WRITE/BB_ENTRY paths**: no fullness check — a check would add a
+  cross-core `tail` load to a ~40-instruction sequence. On overflow the
+  producer *laps* the consumer, overwriting unconsumed slots. Backpressure
+  tiers exist to make this rare; the consumer makes it loud:
 
-```c
-while (head - tail >= capacity) {
-    __builtin_ia32_pause();
-    tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
-}
-```
-
-The `pause` intrinsic reduces the rate of cache-line acquisitions on the
-consumer's `tail` line. The default policy is `RTMAP_FLAG_DROP_ON_FULL`
-(flags = 0), which drops events rather than stalling the target program.
+The consumer detects laps in `consume_batch`: if `head - tail > capacity`,
+the overwritten range is skipped and counted (`RING_LAP` report, per-ring
+`lapped_events`, exit-summary total). After copying a batch it re-loads
+`head`; if the producer wrapped into the copied window during the copy, the
+whole batch is discarded and the tail resynced — torn 32-byte events are
+never delivered downstream.
 
 ## Control ring
 

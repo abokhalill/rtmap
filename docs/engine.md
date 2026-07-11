@@ -805,6 +805,10 @@ pub struct ShadowStack {
   frames above it (non-local jump) and increments `non_local_jumps`. If
   not found, falls back to normal pop and increments `mismatches`.
   Returns `(Option<ShadowFrame>, frames_unwound)`.
+  **Not wired**: the live `EVENT_RETURN` path uses plain `pop_return`;
+  `pop_return_checked` is unit-tested only. Wiring it requires resolving
+  the PC-semantics mismatch (RETURN events carry the ret instruction's PC,
+  not the call target).
 - **Mismatch**: Incremented when RETURN has empty stack or `return_pc` is
   not on the stack at all (missed CALL, indirect calls).
 - **Non-local jump**: Incremented when `pop_return_checked` detects a
@@ -1015,7 +1019,8 @@ are displayed in the TUI header.
 
 ### Interactive mode (TUI, `tui.rs`)
 
-ratatui with crossterm backend. 20 Hz refresh. Six panels:
+ratatui with crossterm backend. 20 Hz refresh. Six drawn regions; three are
+focusable panels (Memory, Events, Registers — `Panel` enum, Tab to cycle):
 
 1. **Header bar.** Instruction counter, event count, node count, edge count,
    ring count, LAG metric, allocation stats, time-travel indicator, pause

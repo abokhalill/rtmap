@@ -41,7 +41,7 @@ Resolution order: **CLI flags > `.rtmap` project > `~/.config/rtmap/config` > au
 # headless (default): print snapshot to stdout, exit on idle
 rtmap ./my_program [-- target_args...]
 
-# interactive TUI (20 Hz refresh, time-travel, 6 panels)
+# interactive TUI (20 Hz refresh, time-travel, 3 focusable panels)
 rtmap ./my_program --live
 
 # server mode: defer tracing until event loop starts, auto-exit after traffic

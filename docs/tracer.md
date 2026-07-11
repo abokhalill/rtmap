@@ -79,7 +79,7 @@ The raw TLS slots are used by inline JIT instrumentation (no clean call):
 | 1 | `RTMAP_RAW_SLOT_HEAD` | Cached head counter (deferred release store) |
 | 2 | `RTMAP_RAW_SLOT_SEQ` | Cached sequence counter (inline increment) |
 | 3 | `RTMAP_RAW_SLOT_TID` | Thread ID (inline event metadata) |
-| 4 | `RTMAP_RAW_SLOT_BP` | Backpressure flag mirror (inline check) |
+| 4 | `RTMAP_RAW_SLOT_BP` | Backpressure tier mirror; written by `flush_head_cache`/`sync_head_cache`, read by inline gates |
 | 5 | `RTMAP_RAW_SLOT_SCRATCH` | Pointer to `rtmap_scratch_pad_t` |
 | 6 | `RTMAP_RAW_SLOT_RDBUF` | Read buffer pointer (inline overflow check) |
 | 7 | `RTMAP_RAW_SLOT_GUARD` | Inline reentrancy guard |

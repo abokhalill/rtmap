@@ -84,18 +84,22 @@ gate observes the new phase on the next BB entry without recompilation.
 
 #### Tiered backpressure
 
-Three levels communicated from engine to tracer via the ring header's
-`bp_level` field:
+Three tiers (`RTMAP_BP_TIER_*`) communicated from engine to tracer via the
+ring header's atomic `backpressure` field, mirrored into raw TLS
+(`RTMAP_RAW_SLOT_BP`) at every head flush so the inline gates see a tier at
+most one BB stale:
 
-| Level | Threshold | Behavior |
+| Tier | Threshold | Behavior |
 |---|---|---|
 | 0 | Ring < 6/8 full | All events emitted |
-| 1 | Ring ≥ 6/8 full | READ and BB_ENTRY suppressed |
-| 2 | Ring ≥ 7/8 full | Only ALLOC, FREE, and bloom-gated writes survive |
+| 1 | Ring ≥ 6/8 full | Buffered READs suppressed (bloom-priority survive); inline BB_ENTRY suppressed |
+| 2 | Ring ≥ 7/8 full | Additionally all inline main-module WRITEs suppressed; ALLOC/FREE/CALL/RETURN always land |
 
-Hysteresis: clears at 3/8. The bloom filter is populated per stamped
-allocation's fields (`alloc_base + field_offset`), ensuring initialization
-writes to typed heap survive BP=2.
+Hysteresis: clears at 3/8. Shedding is counted per-thread and reported at
+tracer exit (`wr_shed`/`bb_shed`/`rd_shed`). The bloom filter is populated
+per stamped allocation's fields (`alloc_base + field_offset`) and consulted
+only on the read path — an inline bloom probe would dwarf the inline write
+sequence, so tier 2 sheds writes unconditionally.
 
 #### In-band syscall hooks
 
@@ -307,8 +311,8 @@ modules re-exported from `lib.rs`, with four binary entry points.
     correction (`contention_score_weighted`). Longjmp-aware shadow stacks
     (`pop_return_checked`, `non_local_jumps` counter). Live register file.
 
-15. **Rendering** (`tui.rs`, `main.rs`). Interactive ratatui TUI at 20 Hz
-    with six panels.
+15. **Rendering** (`tui.rs`, `main.rs`). Interactive ratatui TUI at 20 Hz;
+    three focusable panels (Memory, Events, Registers).
 
 ### Headless exit path
 
@@ -408,10 +412,9 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
          │
          ▼
  [4] shadow_stack.pop_return()
-     (or pop_return_checked for longjmp detection:
-      if return_pc ≠ top.callee_pc, scan stack for
-      matching frame, unwind intermediate frames,
-      increment non_local_jumps)
+     (pop_return_checked — longjmp-aware unwind —
+      exists and is unit-tested but is NOT wired
+      into the live EVENT_RETURN path)
 ```
 
 ### Recording path (live → `.bin` → replay)

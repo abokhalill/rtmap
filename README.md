@@ -196,7 +196,7 @@ and assertion DSL.
  │  (no code cache flush)    │                │  reconciler.rs (event dispatch)   │
  │                           │                │  world.rs      (STM, Visual ASan) │
  │  tiered backpressure:     │                │  dwarf.rs      (DWARF + CFI)      │
- │  BP=0/1/2, bloom-gated    │                │  heap_graph.rs (pointer topology) │
+ │  BP=0/1/2, shed counted   │                │  heap_graph.rs (pointer topology) │
  │                           │                │                                   │
  │  fork -> child gets own   │                │                                   │
  │  PID-scoped ctl + rings   │                │                                   │

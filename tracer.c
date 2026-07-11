@@ -2383,8 +2383,18 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     dr_register_fork_init_event(event_fork_init);
     drmgr_register_signal_event(event_signal_fastpath_recover);
 
-    drmgr_register_bb_instrumentation_event(event_bb_analysis,
-                                            event_bb_insert, NULL);
+    /* insert AFTER drwrap (500): its hook clean calls at wrap-entry/retaddr
+     * instructions must execute before our pre_write pre-fills a slot there,
+     * or the hook's push lands in the in-flight slot. Pending
+     * writes never cross BB boundaries, so hooks at BB starts are then safe. */
+    static drmgr_priority_t bb_prio = {
+        sizeof(drmgr_priority_t), "rtmap-insert",
+        NULL /*before*/, DRMGR_PRIORITY_NAME_DRWRAP /*after*/,
+        DRMGR_PRIORITY_INSERT_DRWRAP + 1
+    };
+    if (!drmgr_register_bb_instrumentation_event(event_bb_analysis,
+                                                 event_bb_insert, &bb_prio))
+        DR_ASSERT_MSG(false, "bb instrumentation registration failed");
 
     dr_printf("rtmap: Ghost v3 tracer attached, macro-trampoline inline writes\n");
     dr_printf("rtmap: raw TLS seg=%d off=0x%x, ctl @ %p\n",
